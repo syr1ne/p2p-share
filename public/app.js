@@ -471,25 +471,37 @@
         status(`↑ ${i} file${i === 1 ? '' : 's'} added`);
       } catch (e) { fail(e); }
     }
+    // downloads in progress; "cancel" stops all of them
+    const running = new Set();
+    const cancelBtn = el('button', { class: 'link', hidden: true, onclick: () => running.forEach(c => c.abort()) }, 'cancel');
     async function get(path, isDir) {
-      const name = path.split('/').pop();
+      const name = path.split('/').pop(), ctl = new AbortController(), sig = ctl.signal;
+      running.add(ctl);
+      cancelBtn.hidden = false;
       try {
         if (!isDir) {
           const f = src.files.get(path);
-          const blob = await src.get(path, b => status(`↓ ${name} ${pct(b, f.size)}`));
+          const blob = await src.get(path, b => status(`↓ ${name} ${pct(b, f.size)}`), sig);
+          if (sig.aborted) throw sig.reason;
           save(blob, name);
           return status(`↓ ${name} done`);
         }
         const list = [...src.files.values()].filter(f => f.path.startsWith(path + '/'));
         const entries = [];
         for (const [i, f] of list.entries()) {
-          const blob = await src.get(f.path, b => status(`↓ ${i + 1}/${list.length} ${f.path} ${pct(b, f.size)}`));
+          const blob = await src.get(f.path, b => status(`↓ ${i + 1}/${list.length} ${f.path} ${pct(b, f.size)}`), sig);
+          if (sig.aborted) throw sig.reason;
           entries.push({ name: f.path.slice(path.length - name.length), blob, mtime: f.mtime });
         }
         status(`zipping ${name}…`);
         save(await zip(entries), name + '.zip');
         status(`↓ ${name}.zip done`);
-      } catch (e) { fail(e); }
+      } catch (e) {
+        sig.aborted ? status(`↓ ${name} cancelled`) : fail(e);
+      } finally {
+        running.delete(ctl);
+        cancelBtn.hidden = !running.size;
+      }
     }
 
     function row(label, meta, acts) {
@@ -558,7 +570,7 @@
       el('section', { class: 'panel' }, el('div', { class: 'row' }, el('h2', {}, 'files'), crumbs, tools), filesEl),
     ];
     refresh();
-    return { els: el_, refresh };
+    return { els: el_, refresh, cancel: cancelBtn };
   }
 
   let view = null;
@@ -772,7 +784,7 @@
         el('p', { class: 'mute' }, 'send the link and pin to someone. a new pin disconnects everyone. sharing stops when you close this tab and resumes when you reopen it.'),
       ),
       ...v.els,
-      status,
+      el('div', { class: 'row' }, status, v.cancel),
       el('div', { class: 'row' }, el('span', { class: 'grow' }), el('button', { class: 'link', onclick: e => ask(e.target, 'delete it all & free the name?', end) }, 'stop sharing & delete everything')),
     );
     view = v;
@@ -847,7 +859,7 @@
 
     function addPeer(id) {
       const pc = new RTCPeerConnection({ iceServers: sig.ice });
-      const p = { id, pc, dc: null, open: false, q: Promise.resolve(), ups: new Map(), rx: {} };
+      const p = { id, pc, dc: null, open: false, q: Promise.resolve(), ups: new Map(), stop: new Set(), rx: {} };
       pc.onicecandidate = e => e.candidate && sig.send({ t: 'sig', to: id, data: { c: e.candidate } });
       pc.onconnectionstatechange = () => p.pc === pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed') && drop(id);
       pc.ondatachannel = e => {
@@ -913,8 +925,12 @@
           const path = clean(m.path);
           const f = path && files.has(path) && await db.get('files', path);
           if (!f) return fail('not found');
-          await stream(p.pc, p.dc, req, f.blob);
-          return tx(p.dc, { t: 'end', req });
+          await stream(p.pc, p.dc, req, f.blob, null, () => p.stop.has(req));
+          return p.stop.delete(req) || tx(p.dc, { t: 'end', req });
+        }
+        case 'cancel': {
+          if (p.stop.size < 64) p.stop.add(req);
+          return;
         }
         case 'put': {
           if (!rw) return fail('read-only share');
@@ -1161,10 +1177,13 @@
     const src = {
       files, notes,
       writable: () => mode === 'rw',
-      get: (path, prog) => new Promise((res, rej) => {
+      get: (path, prog, signal) => new Promise((res, rej) => {
         const req = ++n;
         pend.set(req, { parts: [], got: 0, res, rej, prog });
         tx(dc, { t: 'get', req, path });
+        if (signal) signal.addEventListener('abort', () => {
+          if (pend.delete(req)) { tx(dc, { t: 'cancel', req }); rej(signal.reason); }
+        });
       }),
       put: async (blob, path, mtime, prog) => {
         const req = ++n, c = dc, p = pc;
@@ -1182,7 +1201,7 @@
     function show() {
       if (v) return v.refresh();
       v = view = panel(src, say);
-      app.replaceChildren(head, ...v.els, status,
+      app.replaceChildren(head, ...v.els, el('div', { class: 'row' }, status, v.cancel),
         el('div', { class: 'row' }, el('span', { class: 'grow' }), el('button', { class: 'link', onclick: () => { store.del(key); form('disconnected'); } }, 'disconnect')));
       say('');
     }

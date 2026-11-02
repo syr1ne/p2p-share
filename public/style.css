@@ -53,3 +53,4 @@ footer { text-align: center; margin-top: 16px; }
 .acts, .row { position: relative; }
 .pop { position: absolute; right: 0; top: calc(100% + 4px); z-index: 1; display: flex; gap: 8px; align-items: baseline; white-space: nowrap; background: var(--bg); border: 1px solid; padding: 4px 8px; font-size: 12px; }
 .qr { display: block; width: 200px; height: 200px; shape-rendering: crispEdges; }
+.row > .status { flex: 1; }
