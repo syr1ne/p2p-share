@@ -1,0 +1,23 @@
+# fly launch --copy-config --name <your-app> && fly deploy
+app = "p2p-share"
+primary_region = "iad"
+
+[build]
+
+[env]
+  TRUST_PROXY = "fly-client-ip"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/healthz"
+    interval = "30s"
+    timeout = "3s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
