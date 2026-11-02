@@ -104,6 +104,23 @@
     addEventListener('keydown', esc);
     no.focus();
   }
+  // qr code as svg, drawn from public/qr.js (qrcode-generator, MIT).
+  // always dark on white with a quiet zone, so phone cameras can read it
+  function qrSvg(text) {
+    const q = window.qrcode(0, 'M'), NS = 'http://www.w3.org/2000/svg', svg = (t, a) => {
+      const e = document.createElementNS(NS, t);
+      for (const k in a) e.setAttribute(k, a[k]);
+      return e;
+    };
+    q.addData(text);
+    q.make();
+    const n = q.getModuleCount();
+    let d = '';
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (q.isDark(r, c)) d += `M${c + 4} ${r + 4}h1v1h-1z`;
+    const s = svg('svg', { viewBox: `0 0 ${n + 8} ${n + 8}`, class: 'qr', role: 'img', 'aria-label': 'qr code: ' + text });
+    s.append(svg('rect', { width: '100%', height: '100%', fill: '#fff' }), svg('path', { d, fill: '#000' }));
+    return s;
+  }
   function save(blob, name) {
     const u = URL.createObjectURL(blob);
     const a = el('a', { href: u, download: name });
@@ -711,7 +728,20 @@
     const status = el('p', { class: 'status' });
     const say = t => { status.textContent = t; };
     const link = location.origin + '/' + sess.slug;
-    const pinEl = el('span', { class: 'pin' }, sess.pin);
+    const pinEl = el('span', { class: 'pin' });
+    let pinShown = false;
+    const pinBtn = el('button', { onclick: () => { pinShown = !pinShown; showPin(); } });
+    const showPin = () => {
+      pinEl.textContent = pinShown ? sess.pin : '•••••••';
+      pinBtn.textContent = pinShown ? 'hide' : 'show';
+    };
+    showPin();
+    const qrBox = el('div', { class: 'qrbox', hidden: true });
+    const qrBtn = el('button', { onclick: () => {
+      if (!qrBox.firstChild) qrBox.append(qrSvg(link), el('p', { class: 'mute' }, 'scan with a phone camera to open the link. they still need the pin.'));
+      qrBox.hidden = !qrBox.hidden;
+      qrBtn.textContent = qrBox.hidden ? 'qr' : 'hide qr';
+    } }, 'qr');
     const modeHint = el('span', { class: 'mute' });
     const modeBtn = el('button', { onclick: () => {
       sess.mode = sess.mode === 'rw' ? 'ro' : 'rw';
@@ -734,10 +764,11 @@
       el('div', { class: 'row' }, el('h1', { class: 'grow' }, el('a', { href: '/' }, 'p2p'), ' /' + sess.slug), state),
       el('section', { class: 'panel' }, el('h2', {}, 'access'),
         el('div', { class: 'kv' },
-          el('span', { class: 'mute' }, 'link'), el('span', { class: 'row' }, el('span', { class: 'grow' }, link.replace(/^https?:\/\//, '')), el('button', { onclick: e => copy(link, e.target) }, 'copy')),
-          el('span', { class: 'mute' }, 'pin'), el('span', { class: 'row' }, el('span', { class: 'grow' }, pinEl), el('button', { onclick: e => copy(sess.pin, e.target) }, 'copy'), el('button', { onclick: regen }, 'new pin')),
+          el('span', { class: 'mute' }, 'link'), el('span', { class: 'row' }, el('span', { class: 'grow' }, link.replace(/^https?:\/\//, '')), el('button', { onclick: e => copy(link, e.target) }, 'copy'), qrBtn),
+          el('span', { class: 'mute' }, 'pin'), el('span', { class: 'row' }, el('span', { class: 'grow' }, pinEl), pinBtn, el('button', { onclick: e => copy(sess.pin, e.target) }, 'copy'), el('button', { onclick: regen }, 'new pin')),
           el('span', { class: 'mute' }, 'mode'), el('span', { class: 'row' }, modeBtn, modeHint),
         ),
+        qrBox,
         el('p', { class: 'mute' }, 'send the link and pin to someone. a new pin disconnects everyone. sharing stops when you close this tab and resumes when you reopen it.'),
       ),
       ...v.els,
@@ -921,7 +952,7 @@
     function regen() {
       sess.pin = newPin();
       persist();
-      pinEl.textContent = sess.pin;
+      showPin();
       sig.send({ t: 'pin', pin: sess.pin });
       kickAll('revoked');
     }

@@ -57,7 +57,7 @@ const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; ch
 // (so editing public/ad.html or the app needs no restart)
 const assets = {};
 function load() {
-  for (const f of ['index.html', 'app.js', 'style.css', 'ad.html', 'robots.txt']) {
+  for (const f of ['index.html', 'app.js', 'qr.js', 'style.css', 'ad.html', 'robots.txt']) {
     const file = path.join(PUB, f);
     if (!fs.existsSync(file)) { delete assets['/' + f]; continue; }
     const body = fs.readFileSync(file);
