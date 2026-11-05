@@ -86,23 +86,64 @@
     t.parts = [new Blob(t.parts)];
     t.mem = 0;
   }
-  // small confirm bubble beside a button, instead of a browser dialog
-  function ask(btn, question, yes) {
-    document.querySelectorAll('.pop').forEach(p => p.remove());
-    const close = () => {
+  // sha-256 in plain js: crypto.subtle is missing on plain-http pages, and this
+  // reads big files in slices instead of loading them whole into memory
+  const K256 = Uint32Array.from('428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 d807aa98 12835b01 243185be 550c7dc3 72be5d74 80deb1fe 9bdc06a7 c19bf174 e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da 983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 27b70a85 2e1b2138 4d2c6dfc 53380d13 650a7354 766a0abb 81c2c92e 92722c85 a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070 19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 748f82ee 78a5636f 84c87814 8cc70208 90befffa a4506ceb bef9a3f7 c67178f2'.split(' '), h => parseInt(h, 16));
+  async function sha256(blob, prog) {
+    const H = Uint32Array.of(0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19), W = new Uint32Array(64);
+    const blocks = u => {
+      for (let o = 0; o < u.length; o += 64) {
+        for (let i = 0; i < 16; i++) W[i] = u[o + i * 4] << 24 | u[o + i * 4 + 1] << 16 | u[o + i * 4 + 2] << 8 | u[o + i * 4 + 3];
+        for (let i = 16; i < 64; i++) {
+          const x = W[i - 15], y = W[i - 2];
+          W[i] = ((x >>> 7 | x << 25) ^ (x >>> 18 | x << 14) ^ x >>> 3) + W[i - 7] + ((y >>> 17 | y << 15) ^ (y >>> 19 | y << 13) ^ y >>> 10) + W[i - 16];
+        }
+        let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+        for (let i = 0; i < 64; i++) {
+          const t1 = h + ((e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7)) + (e & f ^ ~e & g) + K256[i] + W[i] | 0;
+          const t2 = ((a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10)) + (a & b ^ a & c ^ b & c) | 0;
+          h = g; g = f; f = e; e = d + t1 | 0; d = c; c = b; b = a; a = t1 + t2 | 0;
+        }
+        H[0] += a; H[1] += b; H[2] += c; H[3] += d; H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+      }
+    };
+    let o = 0;
+    for (let left; (left = blob.size - o) >= 64; o += left) {
+      left = Math.min(4 << 20, left - left % 64);
+      blocks(new Uint8Array(await blob.slice(o, o + left).arrayBuffer()));
+      if (prog) prog(o + left);
+    }
+    // last partial block, then 0x80, zeros and the length in bits
+    const tail = new Uint8Array(await blob.slice(o).arrayBuffer()), pad = new Uint8Array(tail.length < 56 ? 64 : 128), v = new DataView(pad.buffer);
+    pad.set(tail);
+    pad[tail.length] = 0x80;
+    v.setUint32(pad.length - 8, Math.floor(blob.size / 2 ** 29));
+    v.setUint32(pad.length - 4, blob.size % 2 ** 29 * 8);
+    blocks(pad);
+    return [...H].map(x => x.toString(16).padStart(8, '0')).join('');
+  }
+  const HASH = /^[0-9a-f]{64}$/;
+  // small confirm bubble beside a button, instead of a browser dialog.
+  // no() runs when it is dismissed any way other than "yes"
+  function ask(btn, question, yes, no) {
+    document.querySelectorAll('.pop').forEach(p => p.close());
+    const close = ok => {
+      if (!pop.isConnected) return;
       pop.remove();
       removeEventListener('pointerdown', outside, true);
       removeEventListener('keydown', esc);
+      if (ok) yes(); else if (no) no();
     };
     const outside = e => !pop.contains(e.target) && close();
     const esc = e => e.key === 'Escape' && close();
-    const no = el('button', { class: 'link', onclick: close }, 'no');
+    const noBtn = el('button', { class: 'link', onclick: () => close() }, 'no');
     const pop = el('span', { class: 'pop', role: 'alertdialog' }, question,
-      el('button', { onclick: () => { close(); yes(); } }, 'yes'), no);
+      el('button', { onclick: () => close(true) }, 'yes'), noBtn);
+    pop.close = () => close();
     btn.parentElement.append(pop);
     addEventListener('pointerdown', outside, true);
     addEventListener('keydown', esc);
-    no.focus();
+    noBtn.focus();
   }
   // qr code as svg, drawn from public/qr.js (qrcode-generator, MIT).
   // always dark on white with a quiet zone, so phone cameras can read it
@@ -188,6 +229,8 @@
         get: (s, k) => run(s, 'readonly', o => o.get([slug, k])),
         put: (s, v) => run(s, 'readwrite', o => o.put({ ...v, slug })),
         del: (s, k) => run(s, 'readwrite', o => o.delete([slug, k])),
+        // read, check and write in one transaction, so a newer put can't be overwritten
+        patch: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { const v = q.result && fn(q.result); if (v) o.put(v); }; }),
         delPrefix: (s, pre) => run(s, 'readwrite', o => o.delete(IDBKeyRange.bound([slug, pre], [slug, pre + '\uffff']))),
         clear: () => Promise.all(['files', 'notes'].map(s => run(s, 'readwrite', o => o.delete(every)))),
       };
@@ -447,16 +490,39 @@
       const base = cwd() ? cwd() + '/' : '';
       queue = queue.then(() => send(items, base));
     }
+    // yes/no bubble on the status line (the cancel button lives there, even while hidden)
+    const sure = q => new Promise(r => ask(cancelBtn, q, () => r(true), () => r(false)));
+    const short = s => `"${s.length > 40 ? s.slice(0, 18) + '…' + s.slice(-18) : s}"`;
     async function send(items, base) {
-      let i = 0;
+      let i = 0, skipped = 0;
       try {
-        for (const [f, rel] of items) {
-          const p = clean(base + rel);
+        // same content as a file already here, or earlier in this batch? only files
+        // whose size matches another one get hashed, so most uploads skip this
+        const have = new Map(), sizes = new Map(), dups = new Map();
+        for (const f of src.files.values()) if (f.hash) { have.set(f.hash, [f.path, false]); sizes.set(f.size, 1); }
+        for (const [f] of items) sizes.set(f.size, (sizes.get(f.size) || 0) + 1);
+        for (const it of items) {
+          const [f, rel] = it;
+          if (sizes.get(f.size) < 2) continue;
+          it.hash = await sha256(f, b => status(`checking ${rel} ${pct(b, f.size)}`));
+          if (have.has(it.hash)) dups.set(it, have.get(it.hash));
+          else have.set(it.hash, [clean(base + rel), true]);
+        }
+        if (dups.size) {
+          const [[[, rel], [at, batch]]] = dups, same = at === clean(base + rel);
+          status('');
+          const ok = await sure(dups.size > 1 ? `${dups.size} of these files already exist. upload them anyway?`
+            : batch ? `${short(rel)} is the same file as ${short(at)}. upload both?`
+            : `${short(rel)} already exists${same ? '' : ' as ' + short(at)}. upload anyway?`);
+          if (!ok) { skipped = dups.size; items = items.filter(it => !dups.has(it)); }
+        }
+        for (const it of items) {
+          const [f, rel] = it, p = clean(base + rel);
           if (!p) continue;
           i++;
-          await src.put(f, p, f.lastModified, b => status(`↑ ${i}/${items.length} ${rel} ${pct(b, f.size)}`));
+          await src.put(f, p, f.lastModified, b => status(`↑ ${i}/${items.length} ${rel} ${pct(b, f.size)}`), it.hash);
         }
-        status(`↑ ${i} file${i === 1 ? '' : 's'} added`);
+        status(!i && skipped ? 'not uploaded — already here' : `↑ ${i} file${i === 1 ? '' : 's'} added${skipped ? ` · ${skipped} duplicate${skipped === 1 ? '' : 's'} skipped` : ''}`);
       } catch (e) { fail(e); }
     }
     // downloads in progress; "cancel" stops all of them
@@ -703,7 +769,7 @@
     current = location.pathname;
     const files = new Map(), notes = new Map(), peers = new Map(), db = idb(sess.slug);
     try {
-      for (const f of await db.all('files')) files.set(f.path, { path: f.path, size: f.size, mtime: f.mtime });
+      for (const f of await db.all('files')) files.set(f.path, { path: f.path, size: f.size, mtime: f.mtime, hash: HASH.test(f.hash) ? f.hash : null });
       for (const n of await db.all('notes')) notes.set(n.id, { id: n.id, title: n.title, text: n.text, t: n.t });
     } catch {}
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
@@ -722,11 +788,13 @@
       files, notes,
       writable: () => true,
       get: async path => (await db.get('files', path)).blob,
-      put: async (blob, path, mtime) => {
-        const f = { path, size: blob.size, mtime: Number.isSafeInteger(mtime) ? mtime : Date.now() };
+      // hash: when the uploader already worked it out here; guest uploads get hashed by fill()
+      put: async (blob, path, mtime, prog, hash) => {
+        const f = { path, size: blob.size, mtime: Number.isSafeInteger(mtime) ? mtime : Date.now(), hash: HASH.test(hash) ? hash : null };
         await db.put('files', { ...f, blob });
         files.set(path, f);
         changed();
+        if (!f.hash) fill();
       },
       rm: async (path, dir) => {
         if (dir) {
@@ -752,6 +820,29 @@
         changed();
       },
     };
+
+    // every file gets a sha-256 so uploads of the same content can be flagged.
+    // done in the background for guest uploads and files stored before hashes existed
+    let filling = false, again = false;
+    async function fill() {
+      if (filling) return void (again = true);
+      filling = true;
+      do {
+        again = false;
+        for (const f of [...files.values()].filter(f => !f.hash)) {
+          try {
+            const rec = await db.get('files', f.path);
+            if (!rec || files.get(f.path) !== f) continue;
+            const hash = await sha256(rec.blob);
+            if (files.get(f.path) !== f) continue; // replaced or deleted meanwhile
+            await db.patch('files', f.path, r => !r.hash && r.size === f.size && r.mtime === f.mtime && { ...r, hash });
+            f.hash = hash;
+          } catch {}
+        }
+      } while (again);
+      filling = false;
+      changed();
+    }
 
     const state = el('span', { class: 'mute' }, 'connecting…');
     const status = el('p', { class: 'status' });
@@ -805,6 +896,7 @@
       el('div', { class: 'row' }, el('span', { class: 'grow' }), el('button', { class: 'link', onclick: e => ask(e.target, 'delete it all & free the name?', end) }, 'stop sharing & delete everything')),
     );
     view = v;
+    fill();
 
     let live = false;
     const sig = signal(onSignal, () => sig.send({ t: 'host', slug: sess.slug, token: sess.token, pin: sess.pin }));
@@ -1215,7 +1307,7 @@
           files.clear();
           for (const f of arr(m.files)) {
             const path = f && clean(f.path);
-            if (path && Number.isSafeInteger(f.size) && f.size >= 0) files.set(path, { path, size: f.size, mtime: +f.mtime || 0 });
+            if (path && Number.isSafeInteger(f.size) && f.size >= 0) files.set(path, { path, size: f.size, mtime: +f.mtime || 0, hash: HASH.test(f.hash) ? f.hash : null });
           }
           notes.clear();
           for (const x of arr(m.notes)) {
