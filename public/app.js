@@ -133,11 +133,13 @@
   // ---- storage (survives reloads) -------------------------------------------
 
   // shares this browser owns: { slug: { slug, token, pin, mode } }
+  // (only well-formed entries: localStorage is not trusted to be intact)
   function hosts() {
-    const h = store.get('p2p:hosts') || {};
-    const old = store.get('p2p:host'); // v1 kept a single share
-    if (old && old.slug) { h[old.slug] = old; store.set('p2p:hosts', h); store.del('p2p:host'); }
-    return h;
+    const h = store.get('p2p:hosts'), out = {};
+    for (const s of Object.values(h && typeof h === 'object' ? h : {})) {
+      if (s && SLUG.test(s.slug) && /^[\w-]{43}$/.test(s.token) && /^\d{7}$/.test(s.pin)) out[s.slug] = { slug: s.slug, token: s.token, pin: s.pin, mode: s.mode === 'ro' ? 'ro' : 'rw' };
+    }
+    return out;
   }
   function setHost(sess) {
     const h = hosts(), { fresh, ...s } = sess;
@@ -151,7 +153,7 @@
   }
   const joined = () => {
     const out = [];
-    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('p2p:g:')) out.push(k.slice(6)); } } catch {}
+    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('p2p:g:') && SLUG.test(k.slice(6))) out.push(k.slice(6)); } } catch {}
     return out.sort();
   };
 
@@ -160,25 +162,11 @@
     let p;
     const open = () => p || (p = new Promise((res, rej) => {
       const r = indexedDB.open('p2p', 2);
-      r.onupgradeneeded = e => {
-        const d = r.result, t = r.transaction;
-        const make = () => {
-          d.createObjectStore('files', { keyPath: ['slug', 'path'] });
-          d.createObjectStore('notes', { keyPath: ['slug', 'id'] });
-        };
-        if (e.oldVersion < 1) return make();
-        // v1 held one share's data: move it under that share's name
-        const slug = Object.keys(hosts())[0];
-        const fq = t.objectStore('files').getAll(), nq = t.objectStore('notes').getAll();
-        nq.onsuccess = () => {
-          const files = fq.result, notes = nq.result;
-          d.deleteObjectStore('files');
-          d.deleteObjectStore('notes');
-          make();
-          if (!slug) return;
-          for (const f of files) t.objectStore('files').put({ ...f, slug });
-          for (const n of notes) t.objectStore('notes').put({ ...n, slug });
-        };
+      r.onupgradeneeded = () => {
+        const d = r.result;
+        for (const n of [...d.objectStoreNames]) d.deleteObjectStore(n);
+        d.createObjectStore('files', { keyPath: ['slug', 'path'] });
+        d.createObjectStore('notes', { keyPath: ['slug', 'id'] });
       };
       r.onsuccess = () => res(r.result);
       r.onerror = () => rej(r.error);
@@ -748,7 +736,7 @@
       pinBtn.textContent = pinShown ? 'hide' : 'show';
     };
     showPin();
-    const qrBox = el('div', { class: 'qrbox', hidden: true });
+    const qrBox = el('div', { hidden: true });
     const qrBtn = el('button', { onclick: () => {
       if (!qrBox.firstChild) qrBox.append(qrSvg(link), el('p', { class: 'mute' }, 'scan with a phone camera to open the link. they still need the pin.'));
       qrBox.hidden = !qrBox.hidden;
@@ -820,7 +808,7 @@
           return showPeers();
         case 'sig': return onPeerSig(m.from, m.data);
         case 'left': {
-          const p = peers.get(m.from || m.id);
+          const p = peers.get(m.id);
           if (p && (!p.open || p.dc.relay)) drop(p.id);
           return;
         }

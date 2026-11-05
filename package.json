@@ -2,6 +2,7 @@
   "name": "p2p-share",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "description": "minimal browser-to-browser directory sharing",
   "main": "server.js",
   "scripts": {

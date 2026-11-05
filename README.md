@@ -7,13 +7,16 @@ free, open source, no accounts.
 2. send the link and the 7-digit pin to someone
 3. they open the link, type the pin, and you're connected
 
-- **files & folders**: drop anything on the page. folders download as zip.
-- **notes**: a shared clipboard. titled text notes either side can paste and copy.
-- **two-way / one-way**: let the other side add and delete, or only download.
-- **new pin**: disconnects everyone instantly.
-- **live while open**: sharing works while the owner's tab is open. files and notes
-  are kept in the owner's browser (indexeddb), so closing and reopening the tab
-  picks up where you left off. guests reconnect on their own.
+- **files & folders**: drop anything on the page. folders download as zip; downloads can be cancelled.
+- **notes**: a shared clipboard. titled text notes either side can add, edit and copy.
+- **two-way / one-way**: let the other side add, edit and delete, or only download.
+- **pin**: hidden until you click show. a new pin disconnects everyone instantly.
+- **qr code**: show the link as a qr code for phones (the pin is still needed).
+- **several shares**: the home page lists your shares (live or offline) and the ones you joined. kill one to delete it and free the name.
+- **live while open**: a share works while its tab is open. files and notes are kept
+  in the owner's browser (indexeddb), so closing and reopening the tab picks up
+  where you left off. guests reconnect on their own.
+- light / dark theme switch at the top.
 
 ## how it works
 
@@ -49,14 +52,13 @@ or `docker build -t p2p . && docker run -p 8080:8080 p2p`.
 
 any host that supports websockets and https. run a single instance, since rooms live in memory.
 
-- **fly.io**: `fly launch --copy-config && fly deploy`
-- **render**: new blueprint → point it at this repo (`render.yaml`)
-- **vps**: docker + caddy (`reverse_proxy localhost:8080`) for automatic https
+e.g. a vps with docker + caddy (`reverse_proxy localhost:8080`) for automatic https,
+then set `TRUST_PROXY=1`.
 
 | env | default | |
 |---|---|---|
 | `PORT` | `8080` | |
-| `TRUST_PROXY` | off | behind a proxy: `1` = rightmost `x-forwarded-for`, or the header your proxy sets (`fly-client-ip`, `cf-connecting-ip`). only that header is trusted |
+| `TRUST_PROXY` | off | behind a proxy: `1` = rightmost `x-forwarded-for`, or the header your proxy sets (e.g. `cf-connecting-ip`). only that header is trusted |
 | `ORIGIN_HOST` | request host | lock websocket origin, e.g. `p2p.example.com` |
 | `ICE_SERVERS` | google + cloudflare stun | json array of extra stun/turn servers (e.g. your own coturn) |
 | `RELAY` | on | set `0` to disable the relay fallback |
@@ -78,12 +80,6 @@ cloudflare's turn is free up to 1,000 GB/month:
 3. set `TURN_KEY_ID` and `TURN_KEY_API_TOKEN` on the server and restart
 
 the server mints short-lived credentials itself; nothing else to configure.
-
-## ads
-
-edit `public/ad.html`: paste your ad network's snippet between the markers and restart.
-the slot is 100% × 90px. it runs in a sandboxed frame on an opaque origin, so ad code
-can never read anyone's files, notes or pins.
 
 ## security
 
@@ -112,4 +108,4 @@ trust a host, run your own: it's one file.
 
 ## license
 
-MIT
+MIT. `public/qr.js` is [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) by Kazuhiko Arase, also MIT.

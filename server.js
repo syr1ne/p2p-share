@@ -10,7 +10,7 @@ const { WebSocketServer } = require('ws');
 
 const PORT = +process.env.PORT || 8080;
 // behind a proxy, which request header carries the real client ip:
-// "1" = rightmost x-forwarded-for entry, or a header name such as "fly-client-ip"
+// "1" = rightmost x-forwarded-for entry, or a header name such as "cf-connecting-ip"
 const TRUST_PROXY = (process.env.TRUST_PROXY || '').toLowerCase();
 const ORIGIN_HOST = process.env.ORIGIN_HOST || ''; // e.g. "share.example.com"; defaults to the Host header
 const ICE = JSON.parse(process.env.ICE_SERVERS || '[{"urls":"stun:stun.l.google.com:19302"},{"urls":"stun:stun.cloudflare.com:3478"}]');
@@ -33,7 +33,7 @@ const RESERVED = new Set(['ws', 'api', 'app', 'admin', 'static', 'assets', 'inde
 // ---- static ---------------------------------------------------------------
 
 const PUB = path.join(__dirname, 'public');
-const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
+const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
 const SEC = {
   'Content-Security-Policy': CSP,
   'X-Content-Type-Options': 'nosniff',
@@ -44,20 +44,13 @@ const SEC = {
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
   'Strict-Transport-Security': 'max-age=63072000; includeSubDomains',
 };
-// the ad slot is third-party code: it gets an opaque origin so it can never
-// read the app's storage, pins or files, even if opened directly.
-const AD_SEC = {
-  'Content-Security-Policy': 'sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms',
-  'X-Content-Type-Options': 'nosniff',
-  'Referrer-Policy': 'no-referrer',
-};
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.txt': 'text/plain; charset=utf-8' };
 
 // files are read and compressed once, and again whenever they change on disk
-// (so editing public/ad.html or the app needs no restart)
+// (so editing the app needs no restart)
 const assets = {};
 function load() {
-  for (const f of ['index.html', 'app.js', 'qr.js', 'style.css', 'ad.html', 'robots.txt']) {
+  for (const f of ['index.html', 'app.js', 'qr.js', 'style.css', 'robots.txt']) {
     const file = path.join(PUB, f);
     if (!fs.existsSync(file)) { delete assets['/' + f]; continue; }
     const body = fs.readFileSync(file);
@@ -67,7 +60,7 @@ function load() {
       br: zlib.brotliCompressSync(body, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11 } }),
       gz: zlib.gzipSync(body, { level: 9 }),
       etag: 'W/"' + crypto.createHash('sha256').update(body).digest('base64url').slice(0, 16) + '"',
-      headers: { ...(f === 'ad.html' ? AD_SEC : SEC), 'Content-Type': TYPES[path.extname(f)], 'Cache-Control': 'no-cache', Vary: 'Accept-Encoding' },
+      headers: { ...SEC, 'Content-Type': TYPES[path.extname(f)], 'Cache-Control': 'no-cache', Vary: 'Accept-Encoding' },
     };
   }
 }

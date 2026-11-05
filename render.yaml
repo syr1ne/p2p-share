@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: p2p-share
-    runtime: docker
-    plan: free
-    healthCheckPath: /healthz
-    envVars:
-      - key: TRUST_PROXY
-        value: "1"
