@@ -558,10 +558,15 @@
       if (!src.writable()) return;
       const d = new Date(), z = n => String(n).padStart(2, '0');
       const t = `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}.${z(d.getMinutes())}.${z(d.getSeconds())}`;
-      upload(list.map((f, i) => {
+      // two pastes in the same second would overwrite each other: number the later ones
+      const base = cwd() ? cwd() + '/' : '', used = new Set();
+      upload(list.map(f => {
         if (f.name && !/^image\.\w+$/i.test(f.name)) return [f, f.name];
         const ext = (f.type.split('/')[1] || 'png').replace(/\W.*/, '');
-        return [f, `pasted ${t}${list.length > 1 ? ` (${i + 1})` : ''}.${ext}`];
+        let name = `pasted ${t}.${ext}`;
+        for (let n = 2; used.has(name) || src.files.has(clean(base + name)); n++) name = `pasted ${t} (${n}).${ext}`;
+        used.add(name);
+        return [f, name];
       }));
     };
 
@@ -590,9 +595,12 @@
   });
   // paste an image or copied files anywhere (except into a text field) to upload them
   addEventListener('paste', e => {
-    const t = e.target;
-    if (!pasteTo || (t && (/^(INPUT|TEXTAREA)$/.test(t.tagName) || t.isContentEditable))) return;
-    const list = [...((e.clipboardData && e.clipboardData.files) || [])];
+    const t = e.target, cd = e.clipboardData;
+    if (!pasteTo || !cd) return;
+    if (t && (t.tagName === 'TEXTAREA' || t.isContentEditable || (t.tagName === 'INPUT' && !/^(file|button|submit|reset|checkbox|radio|range|color)$/.test(t.type)))) return;
+    // some browsers leave .files empty and only expose pasted images through .items
+    let list = [...(cd.files || [])];
+    if (!list.length) list = [...(cd.items || [])].filter(i => i.kind === 'file').map(i => i.getAsFile()).filter(Boolean);
     if (!list.length) return;
     e.preventDefault();
     pasteTo(list);
