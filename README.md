@@ -7,7 +7,8 @@ free, open source, no accounts.
 2. send the link and the 7-digit pin to someone
 3. they open the link, type the pin, and you're connected
 
-- **files & folders**: drop anything on the page. folders download as zip; downloads can be cancelled.
+- **files & folders**: drag and drop files or folders anywhere on the page, or use the buttons. folders download as zip; downloads can be cancelled.
+- **paste images**: paste a screenshot or copied image (ctrl/cmd+v, outside the note box) to upload it as a file.
 - **notes**: a shared clipboard. titled text notes either side can add, edit and copy.
 - **two-way / one-way**: let the other side add, edit and delete, or only download.
 - **pin**: hidden until you click show. a new pin disconnects everyone instantly.
@@ -30,11 +31,14 @@ instead of asking for a pin.
 
 when two browsers can't reach each other directly (strict nat, routers without
 hairpinning, safari/brave privacy settings, some mobile and office networks), the
-guest falls back to the **relay** after ~6s: frames go through the server's
+guest falls back to the **relay** after ~6s (up to 15s if a direct path was found
+and is still finishing its handshake): frames go through the server's
 websocket, end-to-end encrypted with aes-256-gcm under a key derived (hkdf-sha256)
 from an ecdh p-256 exchange done during the handshake. nonces are per-direction
 counters, so the server can't replay, reorder or drop frames without the
 connection noticing and closing. both sides show "relayed" when it's in use.
+the owner's browser opens a separate socket for each relayed guest, so one slow
+guest can't hold up the others or new people joining.
 
 the server never stores files or notes. it keeps names and hashed pins in memory,
 nothing on disk.
@@ -63,23 +67,9 @@ then set `TRUST_PROXY=1`.
 | `ICE_SERVERS` | google + cloudflare stun | json array of extra stun/turn servers (e.g. your own coturn) |
 | `RELAY` | on | set `0` to disable the relay fallback |
 | `RELAY_MBPS` | `10` | relay speed cap per connection, in megabytes/s |
-| `TURN_KEY_ID` | – | cloudflare turn key id (see below) |
-| `TURN_KEY_API_TOKEN` | – | cloudflare turn api token |
 
-### turn relay (optional)
-
-the built-in relay works out of the box but uses your server's bandwidth. to
-offload that, add a turn server: browsers then get a direct-ish path through
-turn before falling back to the built-in relay. turn only forwards the
-already-encrypted stream and can't read it.
-
-cloudflare's turn is free up to 1,000 GB/month:
-
-1. dash.cloudflare.com → realtime → turn server → create
-2. copy the **turn token id** and **api token**
-3. set `TURN_KEY_ID` and `TURN_KEY_API_TOKEN` on the server and restart
-
-the server mints short-lived credentials itself; nothing else to configure.
+nothing else to set up: no accounts, api keys or outside services. it works with
+the defaults above.
 
 ## security
 

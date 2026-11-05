@@ -15,9 +15,6 @@ const TRUST_PROXY = (process.env.TRUST_PROXY || '').toLowerCase();
 const ORIGIN_HOST = process.env.ORIGIN_HOST || ''; // e.g. "share.example.com"; defaults to the Host header
 const ICE = JSON.parse(process.env.ICE_SERVERS || '[{"urls":"stun:stun.l.google.com:19302"},{"urls":"stun:stun.cloudflare.com:3478"}]');
 if (!Array.isArray(ICE)) throw new Error('ICE_SERVERS must be a json array');
-// optional cloudflare turn relay (free tier) for networks that block direct connections
-const TURN_ID = process.env.TURN_KEY_ID || '';
-const TURN_TOKEN = process.env.TURN_KEY_API_TOKEN || '';
 
 const ROOM_TTL = 30 * 864e5;   // a name stays reserved 30 days after its owner was last online
 const MAX_ROOMS = 100000;
@@ -117,34 +114,6 @@ function ipOf(req) {
   return req.socket.remoteAddress || '?';
 }
 
-// short-lived relay credentials, shared by everyone and refreshed every 2h
-const turn = { list: ICE, until: 0, pending: null };
-async function iceServers() {
-  if (!TURN_ID || !TURN_TOKEN || Date.now() < turn.until) return turn.list;
-  turn.pending = turn.pending || fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(TURN_ID)}/credentials/generate-ice-servers`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${TURN_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ttl: 4 * 3600 }),
-    signal: AbortSignal.timeout(5e3),
-  })
-    .then(r => r.ok ? r.json() : Promise.reject(new Error('http ' + r.status)))
-    .then(j => {
-      const relays = [].concat(j.iceServers || [])
-        // browsers block port 53
-        .map(s => ({ ...s, urls: [].concat(s.urls).filter(u => !/:53(\?|$)/.test(u)) }))
-        .filter(s => s.urls.length && s.username);
-      turn.list = ICE.concat(relays);
-      turn.until = Date.now() + 2 * 36e5;
-    })
-    .catch(e => {
-      console.error('turn credentials:', e.message);
-      turn.until = Date.now() + 6e4;
-    })
-    .finally(() => { turn.pending = null; });
-  await turn.pending;
-  return turn.list;
-}
-
 function originOk(req) {
   try { return new URL(req.headers.origin).host === (ORIGIN_HOST || req.headers.host); } catch { return false; }
 }
@@ -209,18 +178,26 @@ wss.on('connection', ws => {
     n > 0 ? conns.set(ws.ip, n) : conns.delete(ws.ip);
     leave(ws);
   });
-  iceServers().then(ice => send(ws, { t: 'hi', ice }));
+  send(ws, { t: 'hi', ice: ICE });
 });
 
 // encrypted guest <-> host frames, for when a direct connection is impossible.
-// the server sees only ciphertext. frames to/from the host carry the 12-char guest id.
+// the server sees only ciphertext. normally each relayed guest has its own
+// "pipe" socket to the host, so a slow guest can't hold up signaling or other
+// guests; without one, frames to/from the host's main socket carry the 12-char guest id.
 function relay(ws, data) {
   const r = ws.room;
   if (!RELAY || !r || !Buffer.isBuffer(data)) return;
   let to, out;
-  if (ws.role === 'guest') {
+  if (ws.role === 'guest' && ws.pipe) {
+    to = ws.pipe;
+    out = data;
+  } else if (ws.role === 'guest') {
     to = r.host;
     out = Buffer.concat([Buffer.from(ws.id, 'latin1'), data]);
+  } else if (ws.role === 'pipe') {
+    to = ws.guest;
+    out = data;
   } else if (ws.role === 'host' && data.length > 12) {
     to = r.guests.get(data.toString('latin1', 0, 12));
     out = data.subarray(12);
@@ -247,17 +224,29 @@ function refill(ws) {
   ws.bytesAt = now;
 }
 
+function unpipe(g) {
+  const p = g.pipe;
+  g.pipe = null;
+  if (p) p.close(1000);
+}
+
 function leave(ws) {
-  const r = ws.room;
+  const r = ws.room, role = ws.role;
   ws.room = ws.role = null;
   if (!r) return;
-  if (r.host === ws) {
+  if (role === 'pipe') {
+    // the host's side of a relay is gone: drop the guest so it reconnects
+    const g = ws.guest;
+    ws.guest = null;
+    if (g && g.pipe === ws) { g.pipe = null; g.close(1001); }
+  } else if (r.host === ws) {
     r.host = null;
     r.seen = Date.now();
-    for (const g of r.guests.values()) { send(g, { t: 'err', e: 'offline' }); g.room = g.role = null; }
+    for (const g of r.guests.values()) { send(g, { t: 'err', e: 'offline' }); g.room = g.role = null; unpipe(g); }
     r.guests.clear();
   } else if (r.guests.get(ws.id) === ws) {
     r.guests.delete(ws.id);
+    unpipe(ws);
     send(r.host, { t: 'left', id: ws.id });
   }
 }
@@ -270,7 +259,7 @@ function evict() {
 }
 
 function kickGuests(r, why) {
-  for (const g of r.guests.values()) { send(g, { t: why }); g.room = g.role = null; }
+  for (const g of r.guests.values()) { send(g, { t: why }); g.room = g.role = null; unpipe(g); }
   r.guests.clear();
 }
 
@@ -315,6 +304,17 @@ function handle(ws, m) {
       ws.role = 'guest';
       room.guests.set(ws.id, ws);
       return send(ws, { t: 'joined' });
+    }
+    case 'pipe': {
+      // an extra host socket that carries one relayed guest's frames
+      const room = validSlug(m.slug) && rooms.get(m.slug);
+      const g = room && typeof m.id === 'string' && room.guests.get(m.id);
+      if (ws.role || !RELAY || !g || g.pipe || !room.host || !TOKEN.test(m.token) || !same(room.tok, hash(m.token))) return send(ws, { t: 'err', e: 'bad' });
+      g.pipe = ws;
+      ws.guest = g;
+      ws.room = room;
+      ws.role = 'pipe';
+      return send(ws, { t: 'piped' });
     }
     case 'peek': {
       // does a share exist / is its owner online? (names are public anyway: see 'host')

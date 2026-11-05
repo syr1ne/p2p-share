@@ -408,7 +408,7 @@
   // ---- the panel: notes + files, shared by host and guest -----------------
   // src: { files, notes, writable(), get(path, prog), put(blob, path, mtime, prog), rm(path, dir), note(title, text, id), unnote(id) }
 
-  let dropTo = null;
+  let dropTo = null, pasteTo = null;
   function panel(src, status) {
     const open = new Set();
     const notesEl = el('ul', { class: 'ls' });
@@ -539,7 +539,7 @@
             [el('button', { onclick: () => get(f.path) }, 'get'), w && el('button', { onclick: e => ask(e.target, 'delete this file?', () => src.rm(f.path)) }, 'del')]);
         }),
       );
-      if (!dirs.size && !files.length) filesEl.append(el('li', { class: 'empty' }, w ? 'empty — drop files or folders anywhere on the page' : 'empty'));
+      if (!dirs.size && !files.length) filesEl.append(el('li', { class: 'empty' }, w ? 'empty — drop files or folders, or paste an image, anywhere on the page' : 'empty'));
     }
 
     dropTo = async e => {
@@ -551,6 +551,18 @@
         else for (const f of e.dataTransfer.files) items.push([f, f.name]);
       } catch (err) { return fail(err); }
       upload(items);
+    };
+
+    // pasted screenshots are all called "image.png": give them a unique name
+    pasteTo = list => {
+      if (!src.writable()) return;
+      const d = new Date(), z = n => String(n).padStart(2, '0');
+      const t = `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}.${z(d.getMinutes())}.${z(d.getSeconds())}`;
+      upload(list.map((f, i) => {
+        if (f.name && !/^image\.\w+$/i.test(f.name)) return [f, f.name];
+        const ext = (f.type.split('/')[1] || 'png').replace(/\W.*/, '');
+        return [f, `pasted ${t}${list.length > 1 ? ` (${i + 1})` : ''}.${ext}`];
+      }));
     };
 
     const el_ = [
@@ -575,6 +587,15 @@
     if (!dropTo) return;
     e.preventDefault();
     dropTo(e);
+  });
+  // paste an image or copied files anywhere (except into a text field) to upload them
+  addEventListener('paste', e => {
+    const t = e.target;
+    if (!pasteTo || (t && (/^(INPUT|TEXTAREA)$/.test(t.tagName) || t.isContentEditable))) return;
+    const list = [...((e.clipboardData && e.clipboardData.files) || [])];
+    if (!list.length) return;
+    e.preventDefault();
+    pasteTo(list);
   });
 
   // ---- which shares are live in this browser's tabs -------------------------
@@ -869,20 +890,54 @@
       const key = !p.open && p.key && await p.key;
       if (!key || peers.get(p.id) !== p) return;
       const old = p.pc, idb = enc.encode(p.id);
-      const ch = new Relay(key, 1, msg => {
+      old.onconnectionstatechange = null;
+      p.dc = null;
+      old.close();
+      let ws = null;
+      p.pc = { close: () => { if (ws) ws.close(); } };
+      ws = await pipe(p.id);
+      if (peers.get(p.id) !== p) { if (ws) ws.close(); return; }
+      // own socket for this guest; if that fails, share the main one
+      const ch = ws ? new Relay(key, 1, msg => ws.readyState === 1 && ws.send(msg), () => ws.bufferedAmount) : new Relay(key, 1, msg => {
         const f = new Uint8Array(12 + msg.length);
         f.set(idb);
         f.set(msg, 12);
         sig.bin(f);
       }, sig.buffered);
-      p.pc = { ...RELAY_PC, close: () => ch.close() };
+      if (ws) {
+        ws.onmessage = e => typeof e.data !== 'string' && ch.receive(e.data);
+        ws.onclose = () => ch.close();
+      }
+      p.pc = { ...RELAY_PC, close: () => { ch.close(); if (ws) ws.close(); } };
       p.dc = ch;
-      old.close();
       ch.onmessage = ev => onPeerMsg(p, ev.data).catch(() => {});
       ch.onclose = () => drop(p.id);
       p.open = true;
       tx(ch, ls());
       showPeers();
+    }
+
+    // a separate socket per relayed guest, so one slow guest can't hold up
+    // signaling or the others. resolves to null if it can't be set up.
+    function pipe(id) {
+      return new Promise(res => {
+        const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+        const end = ok => {
+          clearTimeout(t);
+          ws.onmessage = ws.onclose = null;
+          if (!ok) ws.close();
+          res(ok ? ws : null);
+        };
+        const t = setTimeout(() => end(false), 5000);
+        ws.binaryType = 'arraybuffer';
+        ws.onmessage = e => {
+          let m;
+          try { m = JSON.parse(e.data); } catch { return end(false); }
+          if (m && m.t === 'hi') ws.send(JSON.stringify({ t: 'pipe', slug: sess.slug, token: sess.token, id }));
+          else end(m && m.t === 'piped');
+        };
+        ws.onclose = () => end(false);
+      });
     }
 
     function drop(id) {
@@ -1018,7 +1073,7 @@
     function form(msg) {
       teardown();
       view = v = null;
-      dropTo = null;
+      dropTo = pasteTo = null;
       state.textContent = '';
       const input = el('input', { class: 'big', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '7', placeholder: '•••••••', 'aria-label': 'pin' });
       const submit = () => {
@@ -1091,7 +1146,10 @@
       p.onicecandidate = e => e.candidate && sig && sig.send({ t: 'sig', data: { c: e.candidate } });
       let opened = false;
       const lost = () => pc === p && (opened ? wait('connection lost — reconnecting…', 2000) : toRelay(p));
-      setTimeout(() => pc === p && !opened && toRelay(p), 6000);
+      // after 6s use the relay, unless a direct (or turn) path was already found
+      // and is just finishing its handshake: then give it up to 15s in total
+      const late = () => pc === p && !opened && toRelay(p);
+      setTimeout(() => /^(connected|completed)$/.test(p.iceConnectionState) ? setTimeout(late, 9000) : late(), 6000);
       p.onconnectionstatechange = () => p.connectionState === 'failed' && lost();
       ch.onopen = () => {
         opened = true;
@@ -1111,13 +1169,19 @@
       const k = p.key && await p.key;
       if (pc !== p || !sig) return;
       if (!k) return wait('could not open a direct connection between your browsers — retrying…', 5000);
-      const s = sig, ch = new Relay(k, 0, msg => s.bin(msg), s.buffered);
+      // hold frames until the host's first one arrives: by then its relay
+      // socket is set up, so nothing can overtake on the way
+      let held = [];
+      const s = sig, ch = new Relay(k, 0, msg => held ? held.push(msg) : s.bin(msg), s.buffered);
       pc = { ...RELAY_PC, close: () => ch.close() };
       dc = ch;
       p.close();
       ch.onmessage = e => onMsg(e.data);
       ch.onclose = () => dc === ch && wait('connection lost — reconnecting…', 2000);
-      s.onbin = buf => ch.receive(buf);
+      s.onbin = buf => {
+        if (held) { for (const m of held) s.bin(m); held = null; }
+        ch.receive(buf);
+      };
       s.send({ t: 'sig', data: { relay: 1 } });
       clearTimeout(timer);
       store.set(key, pin);
@@ -1202,7 +1266,7 @@
   let current = null;
   function route(msg) {
     if (cleanup) cleanup();
-    cleanup = view = dropTo = onTabs = onKill = null;
+    cleanup = view = dropTo = pasteTo = onTabs = onKill = null;
     current = location.pathname;
     const slug = location.pathname.slice(1);
     const hs = hosts();
