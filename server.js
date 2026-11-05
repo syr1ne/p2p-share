@@ -178,7 +178,7 @@ wss.on('connection', ws => {
     n > 0 ? conns.set(ws.ip, n) : conns.delete(ws.ip);
     leave(ws);
   });
-  send(ws, { t: 'hi', ice: ICE });
+  send(ws, { t: 'hi', ice: ICE, hb: 1 }); // hb: answers pings (see 'ping')
 });
 
 // encrypted guest <-> host frames, for when a direct connection is impossible.
@@ -316,6 +316,8 @@ function handle(ws, m) {
       ws.role = 'pipe';
       return send(ws, { t: 'piped' });
     }
+    case 'ping': // browsers check now and then that the socket still works (after sleep, a network switch)
+      return send(ws, { t: 'pong' });
     case 'peek': {
       // does a share exist / is its owner online? (names are public anyway: see 'host')
       if (!validSlug(m.slug)) return send(ws, { t: 'err', e: 'bad' });

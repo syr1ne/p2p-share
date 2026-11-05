@@ -1,22 +1,30 @@
 :root { --fg: #000; --bg: #fff; --mute: #555; --line: #bdbdbd; color-scheme: light; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme=light]) { --fg: #fff; --bg: #000; --mute: #b0b0b0; --line: #444; color-scheme: dark; } }
 :root[data-theme=dark] { --fg: #fff; --bg: #000; --mute: #b0b0b0; --line: #444; color-scheme: dark; }
-.theme { position: fixed; top: 12px; right: 16px; font-size: 13px; }
+/* scrolls away with the page instead of floating over the lists */
+.theme { position: absolute; top: max(12px, env(safe-area-inset-top)); right: max(16px, env(safe-area-inset-right)); font-size: 13px; }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 [hidden] { display: none !important; }
-html { background: var(--bg); color: var(--fg); font: 15.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; -webkit-text-size-adjust: 100%; }
-body { max-width: 680px; margin: 0 auto; padding: 10vh 16px 32px; min-height: 100vh; display: flex; flex-direction: column; }
+html { background: var(--bg); color: var(--fg); font: 15.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
+html.busy { overscroll-behavior-y: contain; } /* no pull-to-refresh mid-transfer */
+body { max-width: 680px; margin: 0 auto; padding: 10vh max(16px, env(safe-area-inset-right)) max(32px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
 body.drag { outline: 1px dashed var(--fg); outline-offset: -8px; }
 main { flex: 1; }
 main > * + * { margin-top: 24px; }
 
 a { color: inherit; text-underline-offset: 3px; }
-button, .btn { font: inherit; color: inherit; background: none; border: 1px solid; padding: 0 10px; cursor: pointer; border-radius: 0; display: inline-block; line-height: 1.7; }
-button:hover, .btn:hover, button:focus-visible, .btn:focus-within { background: var(--fg); color: var(--bg); outline: none; }
+button, .btn { font: inherit; color: inherit; background: none; border: 1px solid; padding: 0 10px; cursor: pointer; border-radius: 0; display: inline-block; line-height: 1.7; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+/* hover only where there is a mouse: on touch screens it sticks after a tap */
+@media (hover: hover) {
+  button:hover, .btn:hover { background: var(--fg); color: var(--bg); }
+  button.link:hover { background: none; color: var(--mute); }
+}
+button:focus-visible, .btn:focus-visible, button:active, .btn:active { background: var(--fg); color: var(--bg); outline: none; }
 button.link { border: 0; padding: 0; text-decoration: underline; text-underline-offset: 3px; }
-button.link:hover { background: none; color: var(--mute); }
-input, textarea { font: inherit; color: inherit; background: none; border: 0; border-bottom: 1px solid; border-radius: 0; padding: 0; outline: none; }
+button.link:active { background: none; color: var(--mute); }
+/* 16px: ios zooms the page into smaller text fields */
+input, textarea { font: inherit; font-size: 16px; color: inherit; background: none; border: 0; border-bottom: 1px solid; border-radius: 0; padding: 0; outline: none; }
 input:focus, textarea:focus { border-color: var(--fg); }
 textarea { width: 100%; border: 1px solid var(--line); padding: 8px; resize: vertical; min-height: 120px; }
 input[type=file] { display: none; }
@@ -31,9 +39,11 @@ h2 { font: inherit; font-size: 12.5px; letter-spacing: .12em; text-transform: up
 .row { display: flex; gap: 8px 12px; align-items: baseline; flex-wrap: wrap; }
 .grow { flex: 1; }
 .kv { display: grid; grid-template-columns: 64px 1fr; gap: 6px 12px; align-items: baseline; }
-.pin { font-size: 24px; letter-spacing: .25em; font-weight: normal; }
+.kv > * { min-width: 0; }
+.url { flex: 1 1 20em; min-width: 0; overflow-wrap: anywhere; } /* too narrow: the buttons go under the link */
+.pin { font-size: 24px; letter-spacing: .25em; font-weight: normal; white-space: nowrap; }
 .big { font-size: 24px; letter-spacing: .25em; width: 9.5em; }
-.name { width: 12em; }
+.name { width: 12em; min-width: 0; }
 .status { min-height: 1.7em; color: var(--mute); overflow-wrap: anywhere; }
 
 .ls { list-style: none; border-top: 1px solid var(--line); }
@@ -43,14 +53,38 @@ h2 { font: inherit; font-size: 12.5px; letter-spacing: .12em; text-transform: up
 .ls .acts { display: flex; gap: 8px; }
 .ls pre { grid-column: 1 / -1; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; padding: 4px 0 8px; }
 
+/* status line + progress; pinned to the bottom of the screen while something transfers */
+.foot.live { position: sticky; bottom: 0; z-index: 2; background: var(--bg); border-top: 1px solid var(--line); padding: 6px 0 max(6px, env(safe-area-inset-bottom)); }
+.bar { display: block; width: 100%; height: 3px; margin-top: 4px; border: 0; background: var(--line); color: var(--fg); -webkit-appearance: none; appearance: none; }
+.bar::-webkit-progress-bar { background: var(--line); }
+.bar::-webkit-progress-value { background: var(--fg); }
+.bar::-moz-progress-bar { background: var(--fg); }
+
 .credit, footer { font-size: 12.5px; color: var(--mute); text-align: center; }
 .credit { margin-top: 48px; }
 footer { margin-top: 6px; }
 
-@media (max-width: 480px) { body { padding-top: 6vh; } .ls li { grid-template-columns: 1fr auto; } .ls .meta { display: none; } }
+/* touch screens: bigger targets */
+@media (pointer: coarse) {
+  button, .btn { padding: 6px 12px; }
+  button.link { padding: 6px 0; }
+  .ls li { padding: 6px 0; }
+}
+@media (max-width: 480px) {
+  body { padding-top: max(56px, 6vh, env(safe-area-inset-top)); }
+  /* name and actions side by side, size or date under the name */
+  .ls li { grid-template-columns: 1fr auto; gap: 0 8px; align-items: center; }
+  .ls .meta { grid-column: 1; grid-row: 2; font-size: 12.5px; line-height: 1.5; }
+  .ls .acts { grid-column: 2; grid-row: 1 / span 2; }
+  .pop { white-space: normal; flex-wrap: wrap; max-width: calc(100vw - 32px); }
+  /* access panel: labels above their values */
+  .kv { grid-template-columns: 1fr; gap: 2px; }
+  .kv > .mute { font-size: 12.5px; letter-spacing: .12em; text-transform: uppercase; }
+  .kv > .mute:not(:first-child) { margin-top: 10px; }
+}
 
 .acts, .row { position: relative; }
-.pop { position: absolute; right: 0; top: calc(100% + 4px); z-index: 1; display: flex; gap: 8px; align-items: baseline; white-space: nowrap; background: var(--bg); border: 1px solid; padding: 4px 8px; font-size: 13.5px; }
-.status ~ .pop { left: 0; flex-wrap: wrap; white-space: normal; } /* long upload questions: full width, wrapped */
+.pop { position: absolute; right: 0; top: calc(100% + 4px); z-index: 3; display: flex; gap: 8px; align-items: baseline; white-space: nowrap; background: var(--bg); border: 1px solid; padding: 4px 8px; font-size: 13.5px; }
+.status ~ .pop { left: 0; top: auto; bottom: calc(100% + 4px); flex-wrap: wrap; white-space: normal; } /* long upload questions: full width, wrapped, above the status line */
 .qr { display: block; width: 200px; height: 200px; shape-rendering: crispEdges; }
 .row > .status { flex: 1; }

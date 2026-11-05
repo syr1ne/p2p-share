@@ -4,7 +4,9 @@
 (() => {
   const SLUG = /^[a-z0-9][a-z0-9-]{1,22}[a-z0-9]$/;
   const ABC = 'abcdefghjkmnpqrstuvwxyz23456789';
-  const LOW = 1 << 20, HIGH = 4 << 20, PART = 8000;
+  // send buffer: refill below LOW, pause above HIGH (chrome closes a channel past 16 MB).
+  // MSG: largest data channel message we send, when the other side accepts it
+  const LOW = 2 << 20, HIGH = 8 << 20, PART = 8000, MSG = 256 << 10;
   const TITLE_MAX = 100, NOTE_MAX = 100000, NOTES_MAX = 200;
   const ZIP_MAX = 0xffffffff; // no zip64: 4 GB per folder download
   const app = document.getElementById('app');
@@ -27,12 +29,17 @@
   };
   // theme: follows the system until a choice is made
   const themeBtn = document.getElementById('theme');
-  const isDark = () => document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  const darkMq = matchMedia('(prefers-color-scheme: dark)');
+  const isDark = () => document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : darkMq.matches;
   function setTheme(t) {
     if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
     themeBtn.textContent = isDark() ? 'light' : 'dark';
+    // the phone's browser bar follows the page
+    const forced = document.documentElement.dataset.theme;
+    document.querySelectorAll('meta[name=theme-color]').forEach(m => { m.content = (forced ? forced === 'dark' : /dark/.test(m.media)) ? '#000' : '#fff'; });
   }
   setTheme(store.get('p2p:theme'));
+  if (darkMq.addEventListener) darkMq.addEventListener('change', () => setTheme());
   themeBtn.addEventListener('click', () => {
     const t = isDark() ? 'light' : 'dark';
     store.set('p2p:theme', t);
@@ -77,12 +84,12 @@
     if (typeof title !== 'string' || typeof text !== 'string' || text.length > NOTE_MAX) return null;
     return { id: id || newId(), title: title.trim().slice(0, TITLE_MAX) || 'untitled', text, t: Date.now() };
   }
-  // big transfers: fold received chunks into a blob every 64 MB so the
-  // browser can page them to disk instead of holding everything in ram
+  // big transfers: fold received chunks into a blob every 16 MB so the
+  // browser can page them to disk instead of holding everything in ram (phones)
   function collect(t, buf) {
     t.parts.push(buf);
     t.mem = (t.mem || 0) + buf.byteLength;
-    if (t.mem < 64 << 20) return;
+    if (t.mem < 16 << 20) return;
     t.parts = [new Blob(t.parts)];
     t.mem = 0;
   }
@@ -90,6 +97,13 @@
   // reads big files in slices instead of loading them whole into memory
   const K256 = Uint32Array.from('428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 d807aa98 12835b01 243185be 550c7dc3 72be5d74 80deb1fe 9bdc06a7 c19bf174 e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da 983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 27b70a85 2e1b2138 4d2c6dfc 53380d13 650a7354 766a0abb 81c2c92e 92722c85 a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070 19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 748f82ee 78a5636f 84c87814 8cc70208 90befffa a4506ceb bef9a3f7 c67178f2'.split(' '), h => parseInt(h, 16));
   async function sha256(blob, prog) {
+    // native when available and the file fits comfortably in memory (less of it on
+    // phones): many times faster, and keeps the main thread free for transfers
+    if (subtle && blob.size <= (coarse() ? 64 : 256) << 20) {
+      const d = new Uint8Array(await subtle.digest('SHA-256', await blob.arrayBuffer()));
+      if (prog) prog(blob.size);
+      return [...d].map(x => x.toString(16).padStart(2, '0')).join('');
+    }
     const H = Uint32Array.of(0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19), W = new Uint32Array(64);
     const blocks = u => {
       for (let o = 0; o < u.length; o += 64) {
@@ -111,7 +125,7 @@
     for (let left; (left = blob.size - o) >= 64; o += left) {
       left = Math.min(4 << 20, left - left % 64);
       blocks(new Uint8Array(await blob.slice(o, o + left).arrayBuffer()));
-      if (prog) prog(o + left);
+      if (prog) await prog(o + left); // may hold the hashing up for a while
     }
     // last partial block, then 0x80, zeros and the length in bits
     const tail = new Uint8Array(await blob.slice(o).arrayBuffer()), pad = new Uint8Array(tail.length < 56 ? 64 : 128), v = new DataView(pad.buffer);
@@ -170,6 +184,59 @@
     a.remove();
     setTimeout(() => URL.revokeObjectURL(u), 6e4);
   }
+  // run fn over items, n at a time; takes no new ones once sig is aborted
+  async function pool(items, n, fn, sig) {
+    let i = 0;
+    const worker = async () => { while (i < items.length && !sig.aborted) { const k = i++; await fn(items[k], k); } };
+    await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+    if (sig.aborted) throw sig.reason;
+  }
+  const clock = s => s < 60 ? Math.ceil(s) + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + String(Math.floor(s % 60)).padStart(2, '0') + 's' : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm';
+  const coarse = () => matchMedia('(pointer: coarse)').matches; // touch screen
+
+  // ---- staying connected in the background ----------------------------------
+
+  // back in front, back online or unfrozen: check connections now instead of
+  // waiting on timers the browser slowed down while the page was hidden
+  const wake = new Set();
+  const woke = () => wake.forEach(f => f());
+  document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && woke());
+  document.addEventListener('resume', woke);
+  addEventListener('online', woke);
+  addEventListener('pageshow', e => e.persisted && woke());
+
+  // a held web lock keeps chrome from freezing the tab while it is in the background
+  function hold() {
+    let gone = false, free = () => { gone = true; };
+    if (navigator.locks) navigator.locks.request('p2p:' + newId(), () => gone ? null : new Promise(r => { free = r; })).catch(() => {});
+    return () => free();
+  }
+
+  // while files are moving: keep the screen on (a phone that locks pauses the page
+  // and drops the connection), no pull-to-refresh, and ask before leaving the page
+  const busy = (() => {
+    const on = new Set();
+    let lock = null, asking = false;
+    const leave = e => { e.preventDefault(); e.returnValue = ''; };
+    async function sync() {
+      const want = on.size > 0;
+      document.documentElement.classList.toggle('busy', want);
+      want ? addEventListener('beforeunload', leave) : removeEventListener('beforeunload', leave);
+      if (!want && lock) { const l = lock; lock = null; l.release().catch(() => {}); }
+      if (!want || lock || asking || !navigator.wakeLock || document.visibilityState !== 'visible') return;
+      asking = true;
+      try {
+        const l = lock = await navigator.wakeLock.request('screen');
+        l.addEventListener('release', () => { if (lock === l) lock = null; });
+      } catch {}
+      asking = false;
+      if (!on.size) sync(); // finished while asking
+    }
+    document.addEventListener('visibilitychange', sync); // the browser drops the lock whenever the page is hidden
+    const set = (key, yes) => { yes ? on.add(key) : on.delete(key); sync(); };
+    set.clear = () => { on.clear(); sync(); };
+    return set;
+  })();
 
   // ---- storage (survives reloads) -------------------------------------------
 
@@ -260,28 +327,41 @@
     st.buf = '';
     try { return JSON.parse(s); } catch { return null; }
   }
+  // wait for room in the send buffer. the relay has no event for that, and a channel
+  // closed along with its connection doesn't always fire one either
   const drain = dc => new Promise(r => {
-    if (dc.relay) {
-      const t = setInterval(() => { if (dc.readyState !== 'open' || dc.bufferedAmount < LOW) { clearInterval(t); r(); } }, 25);
-      return;
-    }
-    const f = () => { dc.removeEventListener('bufferedamountlow', f); dc.removeEventListener('close', f); r(); };
-    dc.addEventListener('bufferedamountlow', f);
-    dc.addEventListener('close', f);
+    const done = () => {
+      clearInterval(t);
+      if (!dc.relay) { dc.removeEventListener('bufferedamountlow', done); dc.removeEventListener('close', done); }
+      r();
+    };
+    const t = setInterval(() => (dc.readyState !== 'open' || dc.bufferedAmount < LOW) && done(), dc.relay ? 25 : 1000);
+    if (!dc.relay) { dc.addEventListener('bufferedamountlow', done); dc.addEventListener('close', done); }
   });
-  async function stream(pc, dc, req, blob, prog, stop) {
-    const n = Math.min(65536, (pc.sctp && pc.sctp.maxMessageSize) || 16384) - 4;
-    for (let o = 0; o < blob.size; o += n) {
-      if (dc.readyState !== 'open') throw new Error('disconnected');
-      if (stop && stop()) return;
-      if (dc.bufferedAmount > HIGH) await drain(dc);
-      const chunk = new Uint8Array(await blob.slice(o, o + n).arrayBuffer());
-      const buf = new Uint8Array(chunk.length + 4);
-      new DataView(buf.buffer).setUint32(0, req);
-      buf.set(chunk, 4);
-      dc.send(buf);
-      if (prog) prog(Math.min(o + n, blob.size));
+  // send blob from byte off on. the file is read 2 MB at a time, the next slice while
+  // this one goes out, in the largest messages the other side takes. prog gets the
+  // bytes that left the send buffer. true when all was sent, false when stop() said
+  // to quit; throws if the connection goes
+  async function stream(pc, dc, req, blob, prog, stop, off = 0) {
+    const n = Math.min(MSG, (pc.sctp && pc.sctp.maxMessageSize) || 65536) - 4;
+    const step = Math.max(1, Math.floor((2 << 20) / n)) * n;
+    const read = o => { const p = blob.slice(o, o + step).arrayBuffer(); p.catch(() => {}); return p; };
+    let next = off < blob.size ? read(off) : null;
+    for (let o = off; o < blob.size; o += step) {
+      const buf = new Uint8Array(await next);
+      next = o + step < blob.size ? read(o + step) : null;
+      for (let i = 0; i < buf.length; i += n) {
+        if (dc.bufferedAmount > HIGH) await drain(dc);
+        if (stop && stop()) return false;
+        if (dc.readyState !== 'open') throw new Error('disconnected');
+        const part = buf.subarray(i, i + n), frame = new Uint8Array(part.length + 4);
+        new DataView(frame.buffer).setUint32(0, req);
+        frame.set(part, 4);
+        dc.send(frame);
+        if (prog) prog(Math.max(0, o + i + part.length - dc.bufferedAmount));
+      }
     }
+    return true;
   }
 
   // ---- relay ---------------------------------------------------------------
@@ -292,7 +372,7 @@
 
   const subtle = window.crypto && crypto.subtle;
   const ECDH = { name: 'ECDH', namedCurve: 'P-256' };
-  const RELAY_PC = { sctp: { maxMessageSize: 32768 } };
+  const RELAY_PC = { sctp: { maxMessageSize: 65536 } }; // + headers, well under the server's 128 KB cap
   const enc = new TextEncoder(), dec = new TextDecoder();
   const b64 = u8 => btoa(String.fromCharCode(...u8));
   async function keypair() {
@@ -416,43 +496,77 @@
   // ---- signaling ----------------------------------------------------------
 
   function signal(onmsg, onopen) {
-    let ws, stop = false, delay = 1000;
+    let ws = null, stop = false, delay = 1000, retry = null, hb = false, pingAt = 0, heard = 0;
     const api = {
       ice: [],
       onbin: null,
       send: m => ws && ws.readyState === 1 && ws.send(JSON.stringify(m)),
       bin: b => ws && ws.readyState === 1 && ws.send(b),
       buffered: () => ws ? ws.bufferedAmount : 0,
-      close: () => { stop = true; if (ws) ws.close(); },
+      close: () => { stop = true; clearTimeout(retry); clearInterval(beat); wake.delete(check); if (ws) ws.close(); },
     };
-    (function connect() {
-      ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
-      ws.binaryType = 'arraybuffer';
-      ws.onmessage = e => {
+    // a socket can die without saying so (laptop sleep, wifi to mobile data): ping the
+    // server, and replace a socket that stopped answering
+    const ping = () => { pingAt = Date.now(); api.send({ t: 'ping' }); };
+    const quiet = () => hb && pingAt > heard;
+    function dead(s) {
+      if (ws !== s) return;
+      s.onclose = s.onmessage = null;
+      s.close();
+      lost();
+    }
+    function lost() {
+      ws = null;
+      if (stop) return;
+      onmsg({ t: 'down' });
+      if (stop) return; // closed by whoever heard about it
+      retry = setTimeout(connect, delay * (.8 + Math.random() * .4));
+      delay = Math.min(delay * 1.6, 15000);
+    }
+    const beat = setInterval(() => {
+      if (!ws || ws.readyState !== 1 || !hb) return;
+      if (quiet() && Date.now() - pingAt > 1e4) return dead(ws);
+      ping();
+    }, 2e4);
+    // back in front or online: reconnect now, or make sure the socket still works
+    function check() {
+      if (stop) return;
+      if (!ws) { clearTimeout(retry); delay = 1000; return connect(); }
+      if (ws.readyState !== 1 || !hb) return;
+      const s = ws;
+      ping();
+      setTimeout(() => quiet() && dead(s), 5000);
+    }
+    wake.add(check);
+    function connect() {
+      if (stop) return;
+      const s = ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+      hb = false;
+      s.binaryType = 'arraybuffer';
+      s.onmessage = e => {
+        heard = Date.now();
         if (typeof e.data !== 'string') return api.onbin && api.onbin(e.data);
         let m;
         try { m = JSON.parse(e.data); } catch { return; }
-        if (!m || typeof m.t !== 'string') return;
+        if (!m || typeof m.t !== 'string' || m.t === 'pong') return;
         if (m.t !== 'hi') return onmsg(m);
         delay = 1000;
+        hb = m.hb === 1; // older servers don't answer pings
         api.ice = arr(m.ice);
         onopen();
       };
-      ws.onclose = () => {
-        if (stop) return;
-        onmsg({ t: 'down' });
-        setTimeout(connect, delay);
-        delay = Math.min(delay * 1.6, 15000);
-      };
-    })();
+      s.onclose = () => ws === s && lost();
+    }
+    connect();
     return api;
   }
 
   // ---- the panel: notes + files, shared by host and guest -----------------
-  // src: { files, notes, writable(), get(path, prog), put(blob, path, mtime, prog), rm(path, dir), note(title, text, id), unnote(id) }
+  // src: { files, notes, writable(), get(path, prog, signal), put(blob, path, mtime, prog, hash, signal), rm(path, dir), note(title, text, id), unnote(id) }
 
   let dropTo = null, pasteTo = null;
-  function panel(src, status) {
+  function panel(src, say, statusEl) {
+    const status = t => view === out && say(t); // quiet once this panel is gone
     const open = new Set();
     const notesEl = el('ul', { class: 'ls' });
     const filesEl = el('ul', { class: 'ls' });
@@ -477,25 +591,68 @@
     const addNote = el('button', { onclick: () => openNote(null) }, '+ note');
     const fileIn = el('input', { type: 'file', multiple: true, onchange: () => { upload([...fileIn.files].map(f => [f, f.name])); fileIn.value = ''; } });
     const dirIn = el('input', { type: 'file', webkitdirectory: true, onchange: () => { upload([...dirIn.files].map(f => [f, f.webkitRelativePath || f.name])); dirIn.value = ''; } });
-    const tools = el('span', { class: 'row' }, el('label', { class: 'btn', tabindex: '0' }, '+ files', fileIn), el('label', { class: 'btn', tabindex: '0' }, '+ folder', dirIn));
+    // labels don't open their file picker from the keyboard on their own
+    const pick = (label, input) => el('label', { class: 'btn', tabindex: '0', onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } } }, label, input);
+    const tools = el('span', { class: 'row' }, pick('+ files', fileIn), pick('+ folder', dirIn));
 
     const cwd = () => { try { return clean(decodeURIComponent(location.hash.slice(1))) || ''; } catch { return ''; } };
     const cd = p => { location.hash = p ? encodeURIComponent(p).replace(/%2F/g, '/') : ''; };
     const fail = e => status('error: ' + (e && e.message || e));
 
-    // one upload batch at a time, into the folder that was open when it was added
+    // transfers in progress, each with an AbortController: "cancel" stops them all
+    const running = new Set(), title0 = document.title, me = {};
+    const bar = el('progress', { class: 'bar', max: '1', value: '0', hidden: true });
+    const cancelBtn = el('button', { class: 'link', hidden: true, onclick: () => running.forEach(c => c.abort()) }, 'cancel');
+    const foot = el('div', { class: 'foot' }, el('div', { class: 'row' }, statusEl, cancelBtn), bar);
+    const track = () => { const c = new AbortController(); running.add(c); idle(); return c; };
+    const untrack = c => { running.delete(c); idle(); };
+    function idle() {
+      cancelBtn.hidden = !running.size;
+      busy(me, running.size > 0);
+      if (running.size) return;
+      bar.hidden = true;
+      foot.classList.remove('live');
+      if (view === out) document.title = title0;
+    }
+    // progress on the status line, bar and tab title: at most 5 updates a second, with speed and time left
+    function meter(total, label) {
+      let drawn = 0, rate = 0, t0 = performance.now(), b0 = 0, prev = t0;
+      return b => {
+        const now = performance.now();
+        if (now - prev > 1500) { t0 = now; b0 = b; } // after a pause (reconnecting): don't average it in
+        prev = now;
+        if (now - t0 >= 1000) {
+          const r = (b - b0) / (now - t0) * 1e3;
+          rate = Math.max(0, rate ? rate * .6 + r * .4 : r);
+          t0 = now;
+          b0 = b;
+        }
+        if ((now - drawn < 200 && b < total) || view !== out) return;
+        drawn = now;
+        const left = rate && b < total ? (total - b) / rate : 0;
+        say(`${label()} ${pct(b, total)}${rate ? ` · ${size(Math.round(rate))}/s` : ''}${left >= 1 ? ` · ${clock(left)} left` : ''}`);
+        bar.value = total ? b / total : 1;
+        bar.hidden = false;
+        foot.classList.add('live');
+        document.title = `${pct(b, total)} · ${title0}`;
+      };
+    }
+
+    // upload batches run one after another, each into the folder that was open when it was added
     let queue = Promise.resolve();
     function upload(items) {
       if (!src.writable() || !items.length) return;
-      const base = cwd() ? cwd() + '/' : '';
-      queue = queue.then(() => send(items, base));
+      const base = cwd() ? cwd() + '/' : '', ctl = track();
+      queue = queue.then(() => send(items, base, ctl)).finally(() => untrack(ctl));
     }
     // yes/no bubble on the status line (the cancel button lives there, even while hidden)
     const sure = q => new Promise(r => ask(cancelBtn, q, () => r(true), () => r(false)));
     const short = s => `"${s.length > 40 ? s.slice(0, 18) + '…' + s.slice(-18) : s}"`;
-    async function send(items, base) {
-      let i = 0, skipped = 0;
+    async function send(items, base, ctl) {
+      const sig = ctl.signal;
+      let done = 0, skipped = 0;
       try {
+        if (sig.aborted) throw sig.reason;
         // same content as a file already here, or earlier in this batch? only files
         // whose size matches another one get hashed, so most uploads skip this
         const have = new Map(), sizes = new Map(), dups = new Map();
@@ -516,45 +673,58 @@
             : `${short(rel)} already exists${same ? '' : ' as ' + short(at)}. upload anyway?`);
           if (!ok) { skipped = dups.size; items = items.filter(it => !dups.has(it)); }
         }
-        for (const it of items) {
-          const [f, rel] = it, p = clean(base + rel);
-          if (!p) continue;
-          i++;
-          await src.put(f, p, f.lastModified, b => status(`↑ ${i}/${items.length} ${rel} ${pct(b, f.size)}`), it.hash);
-        }
-        status(!i && skipped ? 'not uploaded — already here' : `↑ ${i} file${i === 1 ? '' : 's'} added${skipped ? ` · ${skipped} duplicate${skipped === 1 ? '' : 's'} skipped` : ''}`);
-      } catch (e) { fail(e); }
+        if (sig.aborted) throw sig.reason;
+        items = items.filter(([, rel]) => clean(base + rel));
+        const total = items.reduce((s, [f]) => s + f.size, 0);
+        let sent = 0;
+        const show = meter(total, () => items.length === 1 ? `↑ ${items[0][1]}` : `↑ ${done}/${items.length}`);
+        // a few at once, so small files don't each wait out a round trip
+        await pool(items, 3, async it => {
+          const [f, rel] = it;
+          let last = 0;
+          const step = b => { sent += b - last; last = b; show(sent); };
+          await src.put(f, clean(base + rel), f.lastModified, step, it.hash, sig);
+          done++;
+          step(f.size);
+        }, sig);
+        status(!done && skipped ? 'not uploaded — already here' : `↑ ${done} file${done === 1 ? '' : 's'} added${skipped ? ` · ${skipped} duplicate${skipped === 1 ? '' : 's'} skipped` : ''}`);
+      } catch (e) {
+        const stopped = sig.aborted;
+        ctl.abort(); // a failed file stops the rest of its batch
+        stopped ? status(`↑ cancelled${done ? ` · ${done} file${done === 1 ? '' : 's'} added` : ''}`) : fail(e);
+      }
     }
-    // downloads in progress; "cancel" stops all of them
-    const running = new Set();
-    const cancelBtn = el('button', { class: 'link', hidden: true, onclick: () => running.forEach(c => c.abort()) }, 'cancel');
     async function get(path, isDir) {
-      const name = path.split('/').pop(), ctl = new AbortController(), sig = ctl.signal;
-      running.add(ctl);
-      cancelBtn.hidden = false;
+      const name = path.split('/').pop(), ctl = track(), sig = ctl.signal;
       try {
         if (!isDir) {
           const f = src.files.get(path);
-          const blob = await src.get(path, b => status(`↓ ${name} ${pct(b, f.size)}`), sig);
+          const blob = await src.get(path, meter(f ? f.size : 0, () => `↓ ${name}`), sig);
           if (sig.aborted) throw sig.reason;
           save(blob, name);
           return status(`↓ ${name} done`);
         }
         const list = [...src.files.values()].filter(f => f.path.startsWith(path + '/'));
-        const entries = [];
-        for (const [i, f] of list.entries()) {
-          const blob = await src.get(f.path, b => status(`↓ ${i + 1}/${list.length} ${f.path} ${pct(b, f.size)}`), sig);
-          if (sig.aborted) throw sig.reason;
-          entries.push({ name: f.path.slice(path.length - name.length), blob, mtime: f.mtime });
-        }
+        const total = list.reduce((s, f) => s + f.size, 0), entries = [];
+        let got = 0, done = 0;
+        const show = meter(total, () => `↓ ${name}/ ${done}/${list.length}`);
+        await pool(list, 4, async (f, k) => {
+          let last = 0;
+          const step = b => { got += b - last; last = b; show(got); };
+          const blob = await src.get(f.path, step, sig);
+          done++;
+          step(f.size);
+          entries[k] = { name: f.path.slice(path.length - name.length), blob, mtime: f.mtime };
+        }, sig);
         status(`zipping ${name}…`);
         save(await zip(entries), name + '.zip');
         status(`↓ ${name}.zip done`);
       } catch (e) {
-        sig.aborted ? status(`↓ ${name} cancelled`) : fail(e);
+        const stopped = sig.aborted;
+        ctl.abort(); // a failed file stops the rest of the folder
+        stopped ? status(`↓ ${name} cancelled`) : fail(e);
       } finally {
-        running.delete(ctl);
-        cancelBtn.hidden = !running.size;
+        untrack(ctl);
       }
     }
 
@@ -605,7 +775,7 @@
             [el('button', { onclick: () => get(f.path) }, 'get'), w && el('button', { onclick: e => ask(e.target, 'delete this file?', () => src.rm(f.path)) }, 'del')]);
         }),
       );
-      if (!dirs.size && !files.length) filesEl.append(el('li', { class: 'empty' }, w ? 'empty — drop files or folders, or paste an image, anywhere on the page' : 'empty'));
+      if (!dirs.size && !files.length) filesEl.append(el('li', { class: 'empty' }, !w ? 'empty' : coarse() ? 'empty — tap + files to add some' : 'empty — drop files or folders, or paste an image, anywhere on the page'));
     }
 
     dropTo = async e => {
@@ -640,8 +810,9 @@
       el('section', { class: 'panel' }, el('div', { class: 'row' }, el('h2', { class: 'grow' }, 'notes'), addNote), noteForm, notesEl),
       el('section', { class: 'panel' }, el('div', { class: 'row' }, el('h2', {}, 'files'), crumbs, tools), filesEl),
     ];
+    const out = { els: el_, refresh, foot };
     refresh();
-    return { els: el_, refresh, cancel: cancelBtn };
+    return out;
   }
 
   let view = null;
@@ -758,7 +929,7 @@
         } }, el('span', { class: 'mute' }, location.host + '/'), other, el('button', { type: 'submit' }, 'open'))),
       err,
     ].filter(Boolean));
-    name.focus();
+    if (!coarse()) name.focus(); // on phones that would pop the keyboard over the page
   }
 
   // ---- host ---------------------------------------------------------------
@@ -775,9 +946,11 @@
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     const kp = await keypair().catch(() => null);
     if (location.pathname !== '/' + sess.slug) return; // navigated away while loading
+    const unhold = hold();
 
     const persist = () => setHost(sess);
-    const ls = () => ({ t: 'ls', mode: sess.mode, files: [...files.values()], notes: [...notes.values()] });
+    // v 2: gets take an offset and puts can resume, so guests pick up after a reconnect
+    const ls = () => ({ t: 'ls', v: 2, mode: sess.mode, files: [...files.values()], notes: [...notes.values()] });
     let lsTimer;
     const changed = () => {
       clearTimeout(lsTimer);
@@ -822,8 +995,11 @@
     };
 
     // every file gets a sha-256 so uploads of the same content can be flagged.
-    // done in the background for guest uploads and files stored before hashes existed
-    let filling = false, again = false;
+    // done in the background for guest uploads and files stored before hashes existed,
+    // and held off while guests are transferring: hashing a big file in js would halve their speed
+    let filling = false, again = false, serving = 0;
+    const hot = () => serving > 0 || [...peers.values()].some(p => p.ups.size > 0);
+    const cool = async () => { while (hot()) await new Promise(r => setTimeout(r, 1000)); };
     async function fill() {
       if (filling) return void (again = true);
       filling = true;
@@ -831,9 +1007,10 @@
         again = false;
         for (const f of [...files.values()].filter(f => !f.hash)) {
           try {
+            await cool();
             const rec = await db.get('files', f.path);
             if (!rec || files.get(f.path) !== f) continue;
-            const hash = await sha256(rec.blob);
+            const hash = await sha256(rec.blob, cool);
             if (files.get(f.path) !== f) continue; // replaced or deleted meanwhile
             await db.patch('files', f.path, r => !r.hash && r.size === f.size && r.mtime === f.mtime && { ...r, hash });
             f.hash = hash;
@@ -879,20 +1056,21 @@
       state.textContent = live ? `live · ${open.length} connected${r ? ` (${r} relayed)` : ''}` : 'reconnecting…';
     };
 
-    const v = panel(src, say);
+    const v = panel(src, say, status);
     app.replaceChildren(
       el('div', { class: 'row' }, el('h1', { class: 'grow' }, el('a', { href: '/' }, 'p2p'), ' /' + sess.slug), state),
       el('section', { class: 'panel' }, el('h2', {}, 'access'),
         el('div', { class: 'kv' },
-          el('span', { class: 'mute' }, 'link'), el('span', { class: 'row' }, el('span', { class: 'grow' }, link.replace(/^https?:\/\//, '')), el('button', { onclick: e => copy(link, e.target) }, 'copy'), qrBtn),
+          el('span', { class: 'mute' }, 'link'), el('span', { class: 'row' }, el('span', { class: 'url' }, link.replace(/^https?:\/\//, '')), el('button', { onclick: e => copy(link, e.target) }, 'copy'), qrBtn),
           el('span', { class: 'mute' }, 'pin'), el('span', { class: 'row' }, el('span', { class: 'grow' }, pinEl), pinBtn, el('button', { onclick: e => copy(sess.pin, e.target) }, 'copy'), el('button', { onclick: regen }, 'new pin')),
           el('span', { class: 'mute' }, 'mode'), el('span', { class: 'row' }, modeBtn, modeHint),
         ),
         qrBox,
-        el('p', { class: 'mute' }, 'send the link and pin to someone. a new pin disconnects everyone. sharing stops when you close this tab and resumes when you reopen it.'),
+        el('p', { class: 'mute' }, 'send the link and pin to someone. a new pin disconnects everyone. sharing stops when you close this tab and resumes when you reopen it.' +
+          (coarse() ? ' on a phone, keep this page open in front: browsers pause pages in the background.' : '')),
       ),
       ...v.els,
-      el('div', { class: 'row' }, status, v.cancel),
+      v.foot,
       el('div', { class: 'row' }, el('span', { class: 'grow' }), el('button', { class: 'link', onclick: e => ask(e.target, 'delete it all & free the name?', end) }, 'stop sharing & delete everything')),
     );
     view = v;
@@ -906,6 +1084,8 @@
       sig.close();
       for (const p of peers.values()) p.pc.close();
       peers.clear();
+      partial.clear();
+      unhold();
     };
     sig.onbin = buf => {
       if (buf.byteLength <= 12) return;
@@ -1044,9 +1224,38 @@
       const p = peers.get(id);
       if (!p) return;
       peers.delete(id);
+      for (const u of p.ups.values()) park(u);
+      p.ups.clear();
       try { p.pc.close(); } catch {}
       showPeers();
+      serve();
     }
+
+    // guest uploads by the guest's upload id. one whose connection drops is kept a
+    // while, so the guest can carry on from where it got to instead of starting over
+    const partial = new Map(), stored = new Set();
+    const serve = () => busy('serve', hot());
+    function forget(u) {
+      clearTimeout(u.ttl);
+      if (u.peer && u.peer.ups.get(u.req) === u) u.peer.ups.delete(u.req);
+      if (partial.get(u.id) === u) partial.delete(u.id);
+      serve();
+    }
+    function park(u) {
+      u.peer = null;
+      if (partial.get(u.id) !== u) return;
+      clearTimeout(u.ttl);
+      u.ttl = setTimeout(() => !u.peer && forget(u), 10 * 6e4);
+    }
+    function keep(u) {
+      if (partial.size >= 16) {
+        let k = partial.keys().next().value; // full: drop the oldest, preferably one nobody is sending
+        for (const [id, x] of partial) if (!x.peer) { k = id; break; }
+        partial.delete(k);
+      }
+      partial.set(u.id, u);
+    }
+    const saved = (p, req, ok) => tx(p.dc, ok ? { t: 'ok', req } : { t: 'err', req, e: 'host is out of storage' });
 
     // everything a guest sends is untrusted
     async function onPeerMsg(p, data) {
@@ -1054,8 +1263,8 @@
         if (data.byteLength < 4) return;
         const req = new DataView(data).getUint32(0), u = p.ups.get(req);
         if (!u) return;
+        if (u.got + data.byteLength - 4 > u.size) return forget(u);
         u.got += data.byteLength - 4;
-        if (u.got > u.size) return void p.ups.delete(req);
         collect(u, new Uint8Array(data, 4));
         return;
       }
@@ -1068,28 +1277,71 @@
           const path = clean(m.path);
           const f = path && files.has(path) && await db.get('files', path);
           if (!f) return fail('not found');
-          await stream(p.pc, p.dc, req, f.blob, null, () => p.stop.has(req));
-          return p.stop.delete(req) || tx(p.dc, { t: 'end', req });
+          // resuming from an offset: only while it is still the same file
+          const off = Number.isSafeInteger(m.off) && m.off > 0 ? m.off : 0;
+          if (off && (off > f.size || m.size !== f.size || m.mtime !== (+f.mtime || 0))) return fail('the file changed — get it again');
+          serving++;
+          serve();
+          try {
+            if (await stream(p.pc, p.dc, req, f.blob, null, () => p.stop.has(req), off)) tx(p.dc, { t: 'end', req });
+          } catch {
+            fail('could not read the file'); // (a no-op if it was the connection that went)
+          } finally {
+            p.stop.delete(req);
+            serving--;
+            serve();
+          }
+          return;
         }
         case 'cancel': {
+          const u = p.ups.get(req);
+          if (u) return forget(u);
           if (p.stop.size < 64) p.stop.add(req);
           return;
         }
         case 'put': {
           if (!rw) return fail('read-only share');
-          const path = clean(m.path);
+          const path = clean(m.path), id = typeof m.id === 'string' && /^[a-z0-9]{12}$/.test(m.id) ? m.id : null;
+          // the guest lost its connection mid-upload and is back: say how far it got
+          if (id && m.resume) {
+            const old = partial.get(id);
+            if (stored.has(id)) return tx(p.dc, { t: 'ok', req });
+            if (old && old.saving) return void old.saving.then(ok => saved(p, req, ok));
+            if (old && old.path === path && old.size === m.size && p.ups.size < 8) {
+              if (old.peer) old.peer.ups.delete(old.req); // late frames from the old connection are ignored
+              clearTimeout(old.ttl);
+              old.peer = p;
+              old.req = req;
+              p.ups.set(req, old);
+              serve();
+              return tx(p.dc, { t: 'at', req, off: old.got });
+            }
+          }
           if (!path || !Number.isSafeInteger(m.size) || m.size < 0 || p.ups.size >= 8) return fail('rejected');
-          p.ups.set(req, { path, size: m.size, mtime: m.mtime, parts: [], got: 0 }); // before any await: chunks follow at once
+          const u = { id: id && !partial.has(id) ? id : null, path, size: m.size, mtime: m.mtime, parts: [], got: 0, peer: p, req };
+          p.ups.set(req, u); // before any await: chunks follow at once
+          if (u.id) keep(u);
+          serve();
+          if (m.resume) tx(p.dc, { t: 'at', req, off: 0 }); // nothing kept: start over
           const q = navigator.storage && navigator.storage.estimate && await navigator.storage.estimate().catch(() => null);
-          if (q && q.quota - q.usage < m.size) { p.ups.delete(req); return fail('host is out of storage'); }
+          if (q && q.quota - q.usage < m.size) { forget(u); return fail('host is out of storage'); }
           return;
         }
         case 'end': {
           const u = p.ups.get(req);
+          if (!u) return;
+          if (u.got !== u.size) { forget(u); return fail('upload incomplete'); }
           p.ups.delete(req);
-          if (!u || u.got !== u.size) return;
-          try { await src.put(new Blob(u.parts), u.path, u.mtime); } catch { return fail('host is out of storage'); }
-          return tx(p.dc, { t: 'ok', req });
+          serve();
+          // a guest that reconnects while this is being stored waits for the same result
+          u.saving = src.put(new Blob(u.parts), u.path, u.mtime).then(() => true, () => false);
+          const ok = await u.saving;
+          forget(u);
+          if (ok && u.id) {
+            stored.add(u.id);
+            if (stored.size > 64) stored.delete(stored.values().next().value);
+          }
+          return saved(p, req, ok);
         }
         case 'rm': {
           if (!rw) return fail('read-only share');
@@ -1110,6 +1362,7 @@
     }
     function regen() {
       sess.pin = newPin();
+      partial.clear(); // whoever was uploading needs the new pin first anyway
       persist();
       showPin();
       sig.send({ t: 'pin', pin: sess.pin });
@@ -1131,24 +1384,41 @@
     document.title = slug + ' · p2p';
     const key = 'p2p:g:' + slug;
     const files = new Map(), notes = new Map(), pend = new Map();
+    // transfers outlive a dropped connection and carry on from where they got to on the
+    // next one; notes and deletes made meanwhile wait in the outbox
+    const xfers = new Set(), outbox = [];
     let pin = store.get(key), mode = 'ro', sig = null, pc = null, dc = null, rxs = {}, n = 0, timer = null, v = null;
+    let ready = false, retrying = false, hostV = 0, relayed = false;
+    const unhold = hold();
 
     const state = el('span', { class: 'mute' });
     const status = el('p', { class: 'status' });
     const say = t => { status.textContent = t; };
     const head = el('div', { class: 'row' }, el('h1', { class: 'grow' }, el('a', { href: '/' }, 'p2p'), ' /' + slug), state);
 
-    function teardown() {
+    // keep: a reconnect follows, so transfers and the outbox wait for it
+    function teardown(keep) {
       clearTimeout(timer);
+      ready = retrying = false;
       const s = sig, p = pc;
       sig = pc = dc = null;
       if (s) s.close();
       if (p) p.close();
-      for (const p of pend.values()) p.rej(new Error('disconnected'));
       pend.clear();
       rxs = {};
+      if (keep) return;
+      for (const x of [...xfers]) finish(x, new Error('disconnected'));
+      outbox.length = 0;
     }
-    cleanup = teardown;
+    const quit = () => { teardown(); unhold(); wake.delete(onWake); };
+    cleanup = quit;
+    // back in front or online: retry now instead of when the (slowed down) timer fires
+    function onWake() {
+      const p = pc;
+      if (retrying) connect();
+      else if (p && p.lost && /^(disconnected|failed)$/.test(p.connectionState || p.iceConnectionState)) p.lost();
+    }
+    wake.add(onWake);
 
     // nobody owns this name: say so instead of asking for a pin
     function missing() {
@@ -1157,7 +1427,7 @@
           el('p', {}, `nobody is sharing /${slug}.`),
           el('p', { class: 'mute' }, 'check the link, or take the name for yourself.'),
           el('div', { class: 'row' },
-            el('button', { onclick: () => host({ slug, token: newToken(), pin: newPin(), mode: 'rw', fresh: true }) }, `create /${slug}`),
+            el('button', { onclick: () => { quit(); host({ slug, token: newToken(), pin: newPin(), mode: 'rw', fresh: true }); } }, `create /${slug}`),
             el('a', { href: '/' }, 'home'))));
     }
 
@@ -1165,7 +1435,7 @@
       if (pin) return connect();
       app.replaceChildren(head, status);
       const s = await peek(slug);
-      if (cleanup !== teardown) return; // navigated away
+      if (cleanup !== quit) return; // navigated away
       if (!s.exists) return missing();
       form(s.live ? '' : `the owner of /${slug} is offline right now. you can still enter the pin; you'll connect when they're back.`);
     }
@@ -1193,18 +1463,19 @@
     }
 
     function wait(msg, ms) {
-      teardown();
+      teardown(true);
       state.textContent = 'waiting';
       if (!v) app.replaceChildren(head, status);
-      say(msg);
+      say(msg + (xfers.size ? ' · transfers paused' : ''));
+      retrying = true;
       timer = setTimeout(connect, ms);
     }
 
     function connect() {
-      teardown();
-      state.textContent = 'connecting…';
+      teardown(true);
+      state.textContent = v ? 'reconnecting…' : 'connecting…';
       if (!v) app.replaceChildren(head, status);
-      say('');
+      if (!xfers.size) say('');
       const s = sig = signal(m => sig === s && onSignal(m), () => s.send({ t: 'join', slug, pin }));
       timer = setTimeout(() => wait('could not reach the other browser directly — retrying…', 3000), 25000);
     }
@@ -1219,7 +1490,7 @@
           p.q = p.q.then(() => d.d ? p.setRemoteDescription(d.d) : d.c ? p.addIceCandidate(d.c) : 0).catch(() => {});
           return;
         }
-        case 'down': if (dc && dc.relay) wait('connection lost — reconnecting…', 2000); return;
+        case 'down': if (dc && dc.relay) wait('connection lost — reconnecting…', 1000); return;
         case 'revoked': store.del(key); return form('access was revoked — ask for the new pin');
         case 'ended': store.del(key); return form('this share has ended');
         case 'err':
@@ -1245,14 +1516,21 @@
       ch.bufferedAmountLowThreshold = LOW;
       p.onicecandidate = e => e.candidate && sig && sig.send({ t: 'sig', data: { c: e.candidate } });
       let opened = false;
-      const lost = () => pc === p && (opened ? wait('connection lost — reconnecting…', 2000) : toRelay(p));
-      // after 6s use the relay, unless a direct (or turn) path was already found
-      // and is just finishing its handshake: then give it up to 15s in total
+      const lost = p.lost = () => pc === p && (opened ? wait('connection lost — reconnecting…', 1000) : toRelay(p));
+      // after 6s use the relay (2.5s if the last connection needed it too), unless a direct
+      // (or turn) path was already found and is just finishing its handshake: then give it up to 15s in total
       const late = () => pc === p && !opened && toRelay(p);
-      setTimeout(() => /^(connected|completed)$/.test(p.iceConnectionState) ? setTimeout(late, 9000) : late(), 6000);
-      p.onconnectionstatechange = () => p.connectionState === 'failed' && lost();
+      setTimeout(() => /^(connected|completed)$/.test(p.iceConnectionState) ? setTimeout(late, 9000) : late(), relayed ? 2500 : 6000);
+      // a path that stays down for 6s rarely comes back by itself: reconnect, transfers resume
+      p.onconnectionstatechange = p.oniceconnectionstatechange = () => {
+        const st = p.connectionState || p.iceConnectionState;
+        clearTimeout(p.down);
+        if (st === 'failed') lost();
+        else if (st === 'disconnected' && opened) p.down = setTimeout(() => /^(disconnected|failed)$/.test(p.connectionState || p.iceConnectionState) && lost(), 6000);
+      };
       ch.onopen = () => {
         opened = true;
+        relayed = false;
         clearTimeout(timer);
         store.set(key, pin);
         if (sig) { sig.close(); sig = null; } // direct from here on
@@ -1275,9 +1553,10 @@
       const s = sig, ch = new Relay(k, 0, msg => held ? held.push(msg) : s.bin(msg), s.buffered);
       pc = { ...RELAY_PC, close: () => ch.close() };
       dc = ch;
+      relayed = true;
       p.close();
       ch.onmessage = e => onMsg(e.data);
-      ch.onclose = () => dc === ch && wait('connection lost — reconnecting…', 2000);
+      ch.onclose = () => dc === ch && wait('connection lost — reconnecting…', 1000);
       s.onbin = buf => {
         if (held) { for (const m of held) s.bin(m); held = null; }
         ch.receive(buf);
@@ -1291,16 +1570,16 @@
     function onMsg(data) {
       if (typeof data !== 'string') {
         if (data.byteLength < 4) return;
-        const p = pend.get(new DataView(data).getUint32(0));
-        if (!p || !p.parts) return;
-        collect(p, new Uint8Array(data, 4));
-        p.got += data.byteLength - 4;
-        if (p.prog) p.prog(p.got);
+        const x = pend.get(new DataView(data).getUint32(0));
+        if (!x || x.up) return;
+        collect(x, new Uint8Array(data, 4));
+        x.got += data.byteLength - 4;
+        if (x.prog) x.prog(x.got);
         return;
       }
       const m = rx(rxs, data);
       if (!m) return;
-      const p = pend.get(m.req);
+      const x = pend.get(m.req);
       switch (m.t) {
         case 'ls':
           mode = m.mode === 'rw' ? 'rw' : 'ro';
@@ -1314,11 +1593,19 @@
             if (x && typeof x.id === 'string' && typeof x.title === 'string' && typeof x.text === 'string' && x.text.length <= NOTE_MAX) notes.set(x.id, { id: x.id, title: x.title.slice(0, TITLE_MAX), text: x.text, t: +x.t || 0 });
           }
           state.textContent = 'connected · ' + (mode === 'rw' ? 'two-way' : 'one-way') + (dc && dc.relay ? ' · relayed' : '');
+          if (!ready) {
+            // first listing on this connection: carry on with whatever was going before
+            ready = true;
+            hostV = +m.v || 0;
+            for (const t of xfers) begin(t);
+            for (const o of outbox.splice(0)) tx(dc, o);
+          }
           return v && v.refresh();
-        case 'end': if (p) { pend.delete(m.req); p.res(new Blob(p.parts)); } return;
-        case 'ok': if (p) { pend.delete(m.req); p.res(); } return;
+        case 'at': if (x && x.up && Number.isSafeInteger(m.off) && m.off >= 0 && m.off <= x.blob.size) pump(x, m.off); return;
+        case 'end': if (x && !x.up) finish(x, null, new Blob(x.parts)); return;
+        case 'ok': if (x && x.up) finish(x); return;
         case 'err':
-          if (p) { pend.delete(m.req); p.rej(new Error(String(m.e).slice(0, 100))); } else say('error: ' + String(m.e).slice(0, 100));
+          if (x) finish(x, new Error(String(m.e).slice(0, 100))); else say('error: ' + String(m.e).slice(0, 100));
           return;
         case 'bye':
           store.del(key);
@@ -1326,34 +1613,72 @@
       }
     }
 
+    function finish(x, err, val) {
+      if (!xfers.delete(x)) return;
+      if (pend.get(x.req) === x) pend.delete(x.req);
+      err ? x.rej(err) : x.res(val);
+    }
+    function transfer(x, signal) {
+      return new Promise((res, rej) => {
+        if (signal && signal.aborted) return rej(signal.reason);
+        x.res = res;
+        x.rej = rej;
+        xfers.add(x);
+        if (signal) signal.addEventListener('abort', () => {
+          if (xfers.has(x) && pend.get(x.req) === x) tx(dc, { t: 'cancel', req: x.req });
+          finish(x, signal.reason);
+        }, { once: true });
+        begin(x);
+      });
+    }
+    // (re)start a transfer on the current connection, from where it got to
+    function begin(x) {
+      if (!ready || !dc || dc.readyState !== 'open') return; // the next connection starts it
+      const req = x.req = ++n;
+      pend.set(req, x);
+      if (!x.up) {
+        if (hostV < 2) { x.parts = []; x.got = x.mem = 0; } // this host can't resume: start over
+        return tx(dc, { t: 'get', req, path: x.path, off: x.got, size: x.size, mtime: x.mtime });
+      }
+      // first try: the bytes follow the request at once. after a reconnect: wait for
+      // the host to say how much it already has ('at')
+      const resume = x.sent && hostV >= 2;
+      x.sent = true;
+      tx(dc, { t: 'put', req, path: x.path, size: x.blob.size, mtime: x.mtime, id: x.id, resume });
+      if (!resume) pump(x, 0);
+    }
+    function pump(x, off) {
+      const c = dc, req = x.req;
+      stream(pc, c, req, x.blob, x.prog, () => x.req !== req || !xfers.has(x), off).then(all => all && tx(c, { t: 'end', req }), e => {
+        if (c.readyState !== 'open' || x.req !== req) return; // connection dropped: begin() picks it up again
+        tx(c, { t: 'cancel', req }); // the file itself can't be read (moved, changed)
+        finish(x, e);
+      });
+    }
+    // notes and deletes made while reconnecting go out once connected again
+    function post(m) {
+      if (ready && dc && dc.readyState === 'open') return tx(dc, m);
+      if (outbox.length < 100) outbox.push(m);
+      say('not connected — will send when reconnected');
+    }
+
     const src = {
       files, notes,
       writable: () => mode === 'rw',
-      get: (path, prog, signal) => new Promise((res, rej) => {
-        const req = ++n;
-        pend.set(req, { parts: [], got: 0, res, rej, prog });
-        tx(dc, { t: 'get', req, path });
-        if (signal) signal.addEventListener('abort', () => {
-          if (pend.delete(req)) { tx(dc, { t: 'cancel', req }); rej(signal.reason); }
-        });
-      }),
-      put: async (blob, path, mtime, prog) => {
-        const req = ++n, c = dc, p = pc;
-        const done = new Promise((res, rej) => pend.set(req, { res, rej }));
-        tx(c, { t: 'put', req, path, size: blob.size, mtime });
-        await stream(p, c, req, blob, prog, () => !pend.has(req));
-        tx(c, { t: 'end', req });
-        return done;
+      get: (path, prog, signal) => {
+        const f = files.get(path) || {};
+        return transfer({ path, size: f.size, mtime: f.mtime, parts: [], got: 0, prog }, signal);
       },
-      rm: async (path, dir) => tx(dc, { t: 'rm', path, dir: !!dir }),
-      note: async (title, text, id) => tx(dc, { t: 'note', title, text, id }),
-      unnote: async id => tx(dc, { t: 'unnote', id }),
+      put: (blob, path, mtime, prog, hash, signal) => transfer({ up: true, id: newId(), blob, path, mtime, prog }, signal),
+      rm: async (path, dir) => post({ t: 'rm', path, dir: !!dir }),
+      note: async (title, text, id) => post({ t: 'note', title, text, id }),
+      unnote: async id => post({ t: 'unnote', id }),
     };
 
     function show() {
       if (v) return v.refresh();
-      v = view = panel(src, say);
-      app.replaceChildren(head, ...v.els, el('div', { class: 'row' }, status, v.cancel),
+      v = view = panel(src, say, status);
+      app.replaceChildren(head, ...v.els, v.foot,
         el('div', { class: 'row' }, el('span', { class: 'grow' }), el('button', { class: 'link', onclick: () => { store.del(key); form('disconnected'); } }, 'disconnect')));
       say('');
     }
@@ -1367,6 +1692,7 @@
   function route(msg) {
     if (cleanup) cleanup();
     cleanup = view = dropTo = pasteTo = onTabs = onKill = null;
+    busy.clear();
     current = location.pathname;
     const slug = location.pathname.slice(1);
     const hs = hosts();

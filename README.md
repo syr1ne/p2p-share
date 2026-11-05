@@ -17,6 +17,11 @@ free, open source, no accounts.
 - **live while open**: a share works while its tab is open. files and notes are kept
   in the owner's browser (indexeddb), so closing and reopening the tab picks up
   where you left off. guests reconnect on their own.
+- **survives drops**: a dropped connection (sleep, a network switch, a phone app
+  switch) reconnects by itself, and uploads and downloads carry on from where they
+  stopped instead of starting over. notes saved meanwhile are sent once back.
+- **phones**: touch-sized controls, progress pinned to the bottom of the screen, and
+  the screen kept awake while files move (a locked phone pauses the page).
 - light / dark theme switch at the top.
 
 ## how it works
