@@ -65,6 +65,8 @@ self.addEventListener('fetch', e => {
     'Content-Disposition': disposition(d.name),
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
+    // never rendered: but if it ever were, it couldn't run anything
+    'Content-Security-Policy': 'sandbox',
   };
   if (d.size != null) headers['Content-Length'] = String(d.size);
   e.respondWith(new Response(body, { headers }));

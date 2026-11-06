@@ -9,7 +9,7 @@
   const LOW = 2 << 20, HIGH = 8 << 20, PART = 8000, MSG = 256 << 10;
   // downloads ask for WIN bytes at a time, INFLIGHT windows ahead (see the wire format)
   const WIN = 1 << 20, INFLIGHT = 4;
-  const TITLE_MAX = 100, NOTE_MAX = 100000, NOTES_MAX = 200, NOTES_PER = 50, ITEMS_MAX = 10000, TOMB_MAX = 2000;
+  const TITLE_MAX = 100, NOTE_MAX = 100000, NOTES_MAX = 200, NOTES_PER = 50, ITEMS_MAX = 10000, TOMB_MAX = 2000, MEMBERS_MAX = 1000;
   // an owner's things wait this long after they go offline (tests may shorten it)
   const grace = () => +window.__p2pGrace || 10 * 6e4;
   // links between guests: at most LINKS_MAX each, closed after LINK_IDLE unused; a link
@@ -60,8 +60,7 @@
   const newPin = () => String(rnd(1e7)).padStart(7, '0');
   const newSlug = () => Array.from({ length: 5 }, () => ABC[rnd(ABC.length)]).join('');
   const newId = () => Array.from({ length: 12 }, () => ABC[rnd(ABC.length)]).join('');
-  const newToken = () => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const newToken = () => b64u(crypto.getRandomValues(new Uint8Array(32)));
   const b64u = u8 => btoa(String.fromCharCode(...u8)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
   // ---- who you are ----------------------------------------------------------
@@ -74,7 +73,7 @@
   // lowercase as the key names are compared by (so "Alice", "alice " and "ali\u200bce" clash)
   function normName(s) {
     if (typeof s !== 'string' || s.length > 256) return null;
-    const d = s.normalize('NFKC').replace(/[\p{Cc}\p{Cf}]/gu, '').replace(/\s+/gu, ' ').trim(), n = [...d].length;
+    const d = s.normalize('NFKC').replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, '').replace(/\s+/gu, ' ').trim(), n = [...d].length;
     return n >= 1 && n <= 24 ? d : null;
   }
   const nameKey = d => d.toLowerCase();
@@ -119,7 +118,7 @@
     if (typeof p !== 'string') return null;
     // a lone surrogate (only ever from a hand-made message) can't be url-encoded
     p = p.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '\ufffd');
-    const parts = p.replace(/\\/g, '/').split('/').map(s => s.replace(/[\x00-\x1f\x7f]/g, '').trim()).filter(s => s && s !== '.' && s !== '..');
+    const parts = p.replace(/\\/g, '/').split('/').map(s => s.replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).filter(s => s && s !== '.' && s !== '..');
     const out = parts.join('/');
     return out && out.length <= 1024 && parts.length <= 32 ? out : null;
   }
@@ -139,18 +138,16 @@
   // sha-256 in plain js: crypto.subtle is missing on plain-http pages, and this
   // reads big files in slices instead of loading them whole into memory
   const K256 = Uint32Array.from('428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 d807aa98 12835b01 243185be 550c7dc3 72be5d74 80deb1fe 9bdc06a7 c19bf174 e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da 983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 27b70a85 2e1b2138 4d2c6dfc 53380d13 650a7354 766a0abb 81c2c92e 92722c85 a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070 19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 748f82ee 78a5636f 84c87814 8cc70208 90befffa a4506ceb bef9a3f7 c67178f2'.split(' '), h => parseInt(h, 16));
-  // signal: stops between slices (and around the native digest, which can't be interrupted)
-  async function sha256(blob, prog, signal) {
+  // only ever over a few MiB (fingerprints, ids). signal: stops between slices
+  // (and around the native digest, which can't be interrupted)
+  async function sha256(blob, signal) {
     const stop = () => { if (signal && signal.aborted) throw signal.reason; };
     stop();
-    // native when available and the file fits comfortably in memory (less of it on
-    // phones): many times faster, and keeps the main thread free for transfers
-    if (subtle && blob.size <= (coarse() ? 64 : 256) << 20) {
+    if (subtle) {
       const buf = await blob.arrayBuffer();
       stop();
       const d = new Uint8Array(await subtle.digest('SHA-256', buf));
       stop();
-      if (prog) prog(blob.size);
       return [...d].map(x => x.toString(16).padStart(2, '0')).join('');
     }
     const H = Uint32Array.of(0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19), W = new Uint32Array(64);
@@ -176,8 +173,6 @@
       const u = new Uint8Array(await blob.slice(o, o + left).arrayBuffer());
       stop();
       blocks(u);
-      if (prog) await prog(o + left); // may hold the hashing up for a while
-      stop();
     }
     // last partial block, then 0x80, zeros and the length in bits
     const tail = new Uint8Array(await blob.slice(o).arrayBuffer()), pad = new Uint8Array(tail.length < 56 ? 64 : 128), v = new DataView(pad.buffer);
@@ -193,8 +188,10 @@
   // no() runs when it is dismissed any way other than "yes"
   function ask(btn, question, yes, no) {
     document.querySelectorAll('.pop').forEach(p => p.close());
+    let shut = false;
     const close = ok => {
-      if (!pop.isConnected) return;
+      if (shut) return;
+      shut = true;
       pop.remove();
       removeEventListener('pointerdown', outside, true);
       removeEventListener('keydown', esc);
@@ -368,13 +365,12 @@
       return {
         all: s => run(s, 'readonly', o => o.getAll(every)),
         get: (s, k) => run(s, 'readonly', o => o.get([slug, k])),
-        put: (s, v, signal) => run(s, 'readwrite', o => o.put({ ...v, slug }), signal),
+        put: (s, v) => run(s, 'readwrite', o => o.put({ ...v, slug })),
         putAll: (s, vs, signal) => run(s, 'readwrite', o => { for (const v of vs) o.put({ ...v, slug }); }, signal),
         del: (s, k) => run(s, 'readwrite', o => o.delete([slug, k])),
         // read, check and write in one transaction, so a newer put can't be overwritten
         patch: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { const v = q.result && fn(q.result); if (v) o.put(v); }; }),
-        delIf: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { if (q.result && fn(q.result)) o.delete([slug, k]); }; }),
-        delPrefix: (s, pre) => run(s, 'readwrite', o => o.delete(IDBKeyRange.bound([slug, pre], [slug, pre + '\uffff']))),
+        delAll: (s, ks) => run(s, 'readwrite', o => { for (const k of ks) o.delete([slug, k]); }),
         clear: () => Promise.all(['items', 'notes', 'members'].map(s => run(s, 'readwrite', o => o.delete(every)))),
       };
     };
@@ -392,12 +388,12 @@
   //   ← welcome { you: { id, name }, v, mode, rev, members, items, notes, tomb }
   //   ← name-taken { suggest }
   // after that the host sends changes, numbered:
-  //   ← delta { rev, items: { add, up, rm }, notes: { up, rm }, members: { up, rm }, mode? }
+  //   ← delta { rev, items: { add, up, rm }, notes: { up, rm }, members: { up }, mode? }
   //   a guest that misses a rev asks: sync {} → ← snap { …same as welcome }
   // items: { id, path, size, mtime, fp, owner, kind: 'stored'|'ref', off }
   //   stored: bytes in the host's indexeddb; ref: bytes in the owner's open tab.
   //   off: when the owner went offline (0 = online)
-  // guest → host: add { items: [{ id, path, size, mtime, fp }], dir? }  ← added { paths: { id: path }, no: [ids] }
+  // guest → host: add { items: [{ id, path, size, mtime, fp }], dir? }  ← added { no: [refused ids] }
   //               rm { ids } | rm { path, dir: true }, note { title, text, id? }, unnote { id }
   //               peer-sig { to: member, data }  → forwarded as peer-sig { from: member, data }
   // host → owner: unshared { ids, by, why: 'deleted'|'one-way' }
@@ -416,10 +412,15 @@
   // INFLIGHT × WIN per transfer, which is what lets the host forward bytes between
   // two guests without storing them, and lets a slow disk or stream set the pace.
 
+  // m: a message, or one already encoded (the same delta to every guest)
   function tx(dc, m) {
     if (!dc || dc.readyState !== 'open') return;
-    const s = JSON.stringify(m);
+    const s = typeof m === 'string' ? m : JSON.stringify(m);
     if (s.length <= PART && !dc.txn) return dc.send(s);
+    // a peer that stops reading (or keeps asking for snapshots) can't make us queue
+    // without limit: past 64 MB of text waiting, it is cut off
+    if ((dc.txb || 0) + s.length > 64e6) { try { dc.close(); } catch {} return; }
+    dc.txb = (dc.txb || 0) + s.length;
     // a big one (a listing of thousands of files) waits for room between parts, so the
     // channel's buffer never overflows; whatever is sent meanwhile queues behind it
     const parts = [];
@@ -432,10 +433,10 @@
         if (dc.bufferedAmount > LOW) await drain(dc);
         dc.send(p);
       }
-    }).catch(() => {}).finally(() => { if (!--dc.txn) dc.txq = null; });
+    }).catch(() => {}).finally(() => { dc.txb -= s.length; if (!--dc.txn) dc.txq = null; });
   }
   function rx(st, raw) {
-    if (typeof raw !== 'string') return null;
+    if (typeof raw !== 'string' || raw.length > 64e3) return null; // ours are parts of PART chars
     let m;
     try { m = JSON.parse(raw); } catch { return null; }
     if (!m || typeof m !== 'object') return null;
@@ -450,13 +451,13 @@
   }
   // wait for room in the send buffer. the relay has no event for that, and a channel
   // closed along with its connection doesn't always fire one either
-  const drain = (dc, low = LOW) => new Promise(r => {
+  const drain = dc => new Promise(r => {
     const done = () => {
       clearInterval(t);
       if (!dc.relay) { dc.removeEventListener('bufferedamountlow', done); dc.removeEventListener('close', done); }
       r();
     };
-    const t = setInterval(() => (dc.readyState !== 'open' || dc.bufferedAmount < low) && done(), dc.relay ? 25 : 1000);
+    const t = setInterval(() => (dc.readyState !== 'open' || dc.bufferedAmount < LOW) && done(), dc.relay ? 25 : 1000);
     if (!dc.relay) { dc.addEventListener('bufferedamountlow', done); dc.addEventListener('close', done); }
   });
   const u32 = n => Number.isSafeInteger(n) && n >= 1 && n <= 0xffffffff;
@@ -594,7 +595,18 @@
     if (i >= 0) { const [w] = slots.splice(i, 1); w.c.slotted = (w.c.slotted || 0) + 1; w.r(); } else serving--;
     serveSync();
   };
-  setInterval(() => { const now = Date.now(); for (const s of live) if (!s.busy && !s.wants.length && now - s.last > 6e4) endServe(s, 'idle'); }, 15e3);
+  // and while others wait, one that moved less than a window in the last minute (a
+  // trickle that only keeps its slot warm) gives it back too
+  setInterval(() => {
+    const now = Date.now();
+    for (const s of live) {
+      if (!s.busy && !s.wants.length && now - s.last > 6e4) { endServe(s, 'idle'); continue; }
+      if (now - s.mark < 6e4) continue;
+      if (slots.length && s.moved < WIN) endServe(s, 'idle');
+      s.mark = now;
+      s.moved = 0;
+    }
+  }, 15e3);
 
   function conn(ctl, bin, maxMsg, hooks) {
     return { ctl, bin, hooks, pulls: new Map(), serves: new Map(), xid: 0, max: Math.min(MSG, maxMsg || 65536) - HDR, used: Date.now(), send: m => tx(ctl, m) };
@@ -660,7 +672,8 @@
     await slot(c);
     s.slot = true;
     live.add(s);
-    s.last = Date.now();
+    s.last = s.mark = Date.now();
+    s.moved = 0;
     if (!s.open) return endServe(s);
     try { s.src = await c.hooks.resolve(c, m.id); } catch (e) { return endServe(s, (e && e.message) || 'not available'); }
     if (!s.open) return endServe(s);
@@ -696,6 +709,7 @@
           c.bin.send(frame(s.xid, w.off + i, buf.subarray(i, i + n)));
         }
         s.last = Date.now();
+        s.moved += buf.length;
         c.used = Date.now();
       }
     } catch {
@@ -707,8 +721,9 @@
   // ---- forwarding (the host, between two guests that can't link directly)
   // to the owner we are the requester, to the guest the owner; only wants the guest
   // sends go upstream, so no more than INFLIGHT windows per transfer are ever in flight here
-  function proxyOpen(down, s, upc, id) {
-    const xid = upc.xid = (upc.xid % 0xffffffff) + 1;
+  const nextXid = c => (c.xid = (c.xid % 0xffffffff) + 1);
+  function proxyOpen(s, upc, id) {
+    const xid = nextXid(upc);
     s.up = { c: upc, xid };
     upc.pulls.set(xid, { down: s, xid });
     upc.send({ t: 'open', xid, id });
@@ -734,7 +749,7 @@
     endServe(s, err);
   }
   // connection gone: close what was forwarded through it, both ways
-  function connClosed(c, why) {
+  function connClosed(c) {
     for (const s of [...c.serves.values()]) endServe(s);
     for (const [xid, a] of [...c.pulls]) {
       c.pulls.delete(xid);
@@ -747,7 +762,7 @@
   // x (one download, across reconnects and routes): { id, got, size, mtime, sink, prog, att }
   // a (one attempt over one connection): { c, x, xid, wins, next }
   function attempt(c, x) {
-    const xid = c.xid = (c.xid % 0xffffffff) + 1;
+    const xid = nextXid(c);
     const a = { c, x, xid, wins: [], next: x.got, meta: false };
     c.pulls.set(xid, a);
     x.att = a;
@@ -915,8 +930,11 @@
   const swOk = () => !!(swReg && swReg.active);
   function swSink(name, size, zip) {
     const id = newId() + newId(), ch = new MessageChannel(), q = [];
-    let qb = 0, asked = false, ended = false, aborted = false, err = null, written = 0, done = null;
+    let qb = 0, asked = false, ended = false, aborted = false, err = null, written = 0, done = null, fail = null, pulled = false;
     const s = { kind: 'sw', onroom: null };
+    const broke = e => { err = err || e; if (s.onroom) s.onroom(); if (fail) fail(err); };
+    // nothing asked for after 30 s: the browser didn't start the download (blocked, or the worker was replaced)
+    const first = setTimeout(() => !pulled && broke(new Error('the browser did not start the download')), 3e4);
     // the worker asks for one chunk at a time: data, the end, or that it's off
     const give = () => {
       asked = false;
@@ -931,8 +949,8 @@
     };
     ch.port1.onmessage = e => {
       const m = e.data || {};
-      if (m.t === 'pull') give();
-      else if (m.t === 'cancel') { err = new Error('the download was cancelled in the browser'); if (s.onroom) s.onroom(); }
+      if (m.t === 'pull') { pulled = true; clearTimeout(first); give(); }
+      else if (m.t === 'cancel') broke(new Error('the download was cancelled in the browser'));
     };
     swReg.active.postMessage({ t: 'dl', id, name, size, zip: !!zip }, [ch.port2]);
     // started by a hidden frame: chromium doesn't send <a download> through service
@@ -960,9 +978,9 @@
       },
       full: () => !err && qb >= 4 * WIN,
       // resolves once the last chunk has been taken
-      close: () => new Promise(r => { if (err) throw err; ended = true; done = () => { stop(); r(); }; if (asked) give(); }),
+      close: () => new Promise((r, j) => { if (err) throw err; ended = true; fail = j; done = () => { stop(); r(); }; if (asked) give(); }),
       // the browser marks the download failed and drops what it had
-      abort: async () => { if (aborted) return; aborted = true; q.length = 0; qb = 0; if (asked) give(); else ch.port1.postMessage({ t: 'abort' }); stop(); },
+      abort: async () => { if (aborted) return; aborted = true; clearTimeout(first); q.length = 0; qb = 0; if (asked) give(); else ch.port1.postMessage({ t: 'abort' }); stop(); },
     });
   }
 
@@ -1108,6 +1126,7 @@
 
   // ---- signaling ----------------------------------------------------------
 
+  const WS_URL = () => (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
   function signal(onmsg, onopen) {
     let ws = null, stop = false, delay = 1000, retry = null, hb = false, pingAt = 0, heard = 0;
     const api = {
@@ -1153,7 +1172,7 @@
     wake.add(check);
     function connect() {
       if (stop) return;
-      const s = ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+      const s = ws = new WebSocket(WS_URL());
       hb = false;
       s.binaryType = 'arraybuffer';
       s.onmessage = e => {
@@ -1175,7 +1194,7 @@
   }
 
   // ---- the panel: notes + files, shared by host and guest -----------------
-  // src: { items, notes, members, me(), writable(), verb, offline(item), hint(),
+  // src: { items, notes, members, me(), writable(), verb, hint(),
   //        add(list, sig, say), fetch(item, sink, prog, sig, waiting), rm(ids), rmDir(path),
   //        note(title, text, id), unnote(id) }
 
@@ -1185,10 +1204,11 @@
     const head = new Uint8Array(8), v = new DataView(head.buffer), M = 1 << 20;
     v.setUint32(0, Math.floor(f.size / 2 ** 32));
     v.setUint32(4, f.size >>> 0);
-    return sha256(new Blob(f.size <= 2 * M ? [head, f] : [head, f.slice(0, M), f.slice(f.size - M)]), null, sig);
+    return sha256(new Blob(f.size <= 2 * M ? [head, f] : [head, f.slice(0, M), f.slice(f.size - M)]), sig);
   }
 
   let dropTo = null, pasteTo = null;
+  const collator = new Intl.Collator(undefined, { numeric: true });
   function panel(src, say, statusEl) {
     const status = t => view === out && say(t); // quiet once this panel is gone
     const open = new Set();
@@ -1342,21 +1362,21 @@
       if (swOk()) return { kind: 'sw', sink: swSink(isDir ? name + '.zip' : name, isDir ? null : size, isDir) };
       return { kind: 'mem' };
     }
-    function get(path, isDir, btn) {
-      const it = !isDir && byPath().get(path);
-      const list = isDir ? [...src.items.values()].filter(f => f.path.startsWith(path + '/')) : it ? [it] : [];
+    function get(path, isDir, it) {
+      const list = isDir ? [...src.items.values()].filter(f => f.path.startsWith(path + '/')) : it && src.items.get(it.id) === it ? [it] : [];
       if (!list.length) return status('not here any more');
       const name = path.split('/').pop(), total = list.reduce((s, f) => s + f.size, 0);
-      fetchTo(choose(name, isDir, total), path, name, isDir, list, total, btn);
+      fetchTo(choose(name, isDir, total), path, name, isDir, list, total);
     }
-    async function fetchTo(how, path, name, isDir, list, total, btn) {
+    async function fetchTo(how, path, name, isDir, list, total) {
       const ctl = track(), sig = ctl.signal, sinks = new Set();
       let sink = how.sink || null;
       if (sink) sinks.add(sink);
       try {
         // in memory only: say so before something big fills it (phones have less)
         if (how.kind === 'mem' && total > (coarse() ? 256 << 20 : 1 << 30)) {
-          const ok = await new Promise(r => ask(btn || cancelBtn, `this browser can only save it from memory (${size(total)}). go ahead?`, () => r(true), () => r(false)));
+          // on the status line (rows are redrawn under it); cancel answers it too
+          const ok = await new Promise(r => { sig.addEventListener('abort', () => r(false), { once: true }); ask(cancelBtn, `this browser can only save it from memory (${size(total)}). go ahead?`, () => r(true), () => r(false)); });
           if (!ok) { status(''); return; }
         }
         if (!isDir) {
@@ -1457,27 +1477,27 @@
         const d = dirs.get(rest.slice(0, i)) || { n: 0, size: 0, owners: new Map(), off: 0 };
         d.n++;
         d.size += f.size;
-        if (src.offline(f)) d.off++;
+        if (f.off) d.off++;
         d.owners.set(f.owner, (d.owners.get(f.owner) || 0) + 1);
         dirs.set(rest.slice(0, i), d);
       }
       const segs = dir ? dir.split('/') : [];
       crumbs.replaceChildren(el('button', { class: 'link', onclick: () => cd('') }, '/'),
         ...segs.flatMap((s, i) => [' ', el('button', { class: 'link', onclick: () => cd(segs.slice(0, i + 1).join('/')) }, s), ' /']));
-      const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true });
+      const byName = collator.compare;
       filesEl.replaceChildren(
         ...[...dirs.keys()].sort(byName).map(d => {
           const x = dirs.get(d), gone = x.off === x.n;
           return row(
             el('button', { class: 'link', onclick: () => cd(pre + d) }, d + '/'),
             `${x.n} · ${size(x.size)} · ${whos(x.owners)}${gone ? ' · offline' : ''}`,
-            [el('button', { disabled: gone, onclick: e => get(pre + d, true, e.target) }, 'get'), w && el('button', { onclick: e => ask(e.target, `delete ${d}/ and all inside?`, () => src.rmDir(pre + d)) }, 'del')],
+            [el('button', { disabled: gone, onclick: () => get(pre + d, true) }, 'get'), w && el('button', { onclick: e => ask(e.target, `delete ${d}/ and all inside?`, () => src.rmDir(pre + d)) }, 'del')],
             gone);
         }),
         ...files.sort((a, b) => byName(a.path, b.path)).map(f => {
-          const name = f.path.slice(pre.length), off = src.offline(f);
+          const name = f.path.slice(pre.length), off = f.off;
           return row(el('span', {}, name), `${size(f.size)} · ${who(f.owner)}${off ? ' · offline' : ''}`,
-            [el('button', { disabled: !!off, onclick: e => get(f.path, false, e.target) }, 'get'), w && el('button', { onclick: e => ask(e.target, f.owner === src.me() ? 'stop sharing this file?' : 'delete this file?', () => src.rm([f.id])) }, 'del')], off);
+            [el('button', { disabled: !!off, onclick: () => get(f.path, false, f) }, 'get'), w && el('button', { onclick: e => ask(e.target, f.owner === src.me() ? 'stop sharing this file?' : 'delete this file?', () => src.rm([f.id])) }, 'del')], off);
         }),
       );
       if (!dirs.size && !files.length) filesEl.append(el('li', { class: 'empty' }, !w ? 'empty' : coarse() ? 'empty — tap + files to add some' : 'empty — drop files or folders, or paste an image, anywhere on the page'));
@@ -1516,7 +1536,7 @@
       el('section', { class: 'panel' }, el('div', { class: 'row' }, el('h2', { class: 'grow' }, 'notes'), addNote), noteForm, notesEl),
       el('section', { class: 'panel' }, el('div', { class: 'row' }, el('h2', {}, 'files'), crumbs, tools), filesEl, hintEl),
     ];
-    const out = { els: el_, refresh, foot };
+    const out = { els: el_, refresh, foot, stop: () => running.forEach(c => c.abort()) };
     refresh();
     return out;
   }
@@ -1582,7 +1602,7 @@
 
   function landing(msg) {
     document.title = 'p2p';
-    const name = el('input', { class: 'name', placeholder: newSlug(), maxlength: '24', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', 'aria-label': 'name' });
+    const name = el('input', { class: 'name', placeholder: newSlug(), maxlength: '24', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', 'aria-label': 'share name' });
     const other = el('input', { class: 'name', placeholder: 'name', maxlength: '24', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', 'aria-label': 'open a share' });
     const err = el('p', { class: 'status' }, msg || '');
     const live = new Set();
@@ -1664,8 +1684,10 @@
     return new Promise((res, rej) => {
       if (sig.aborted) return rej(sig.reason);
       const x = { id: it.id, got: 0, size: it.size, mtime: null, sink, prog, att: null, parked: false, waitFor: '' };
+      const onAbort = () => x.finish(sig.reason);
       x.finish = err => {
         if (!xfers.delete(x)) return;
+        sig.removeEventListener('abort', onAbort);
         clearTimeout(x.retry);
         cancelPull(x);
         err ? rej(err) : res();
@@ -1686,7 +1708,7 @@
         if (r.wait && r.wait !== x.waitFor) waiting(r.wait);
         x.waitFor = r.wait || x.waitFor;
       };
-      sig.addEventListener('abort', () => x.finish(sig.reason), { once: true });
+      sig.addEventListener('abort', onAbort, { once: true });
       sink.onroom = () => { const a = x.att; if (a && a.meta) fill(a); };
       xfers.add(x);
       x.go();
@@ -1699,6 +1721,7 @@
 
   async function host(sess) {
     document.title = sess.slug + ' · p2p';
+    onTabs = null; // (straight from the home page's "create")
     if (location.pathname !== '/' + sess.slug) history.replaceState(null, '', '/' + sess.slug);
     current = location.pathname;
     // items: everything listed. stored ones (the host's own) are in indexeddb by id;
@@ -1726,7 +1749,7 @@
         paths.set(path, it.id);
         if (!it.fp) unfp.push([it, r.blob]);
       }
-      for (const n of await db.all('notes')) notes.set(n.id, { id: n.id, title: n.title, text: n.text, t: n.t, author: MEMBER.test(n.author) ? n.author : myId, editor: MEMBER.test(n.editor) ? n.editor : null });
+      for (const n of await db.all('notes')) if (typeof n.id === 'string' && typeof n.title === 'string' && typeof n.text === 'string') notes.set(n.id, { id: n.id, title: n.title, text: n.text, t: n.t, author: MEMBER.test(n.author) ? n.author : myId, editor: MEMBER.test(n.editor) ? n.editor : null });
     } catch {}
     const online = id => id === myId || [...peers.values()].some(p => p.member === id);
     const holds = id => [...items.values()].some(it => it.owner === id);
@@ -1786,11 +1809,12 @@
         t: 'delta', rev,
         items: { add: [...D.add.values()].map(pubItem), up: [...D.up.values()].map(pubItem), rm: [...D.rm] },
         notes: { up: [...D.nup.values()], rm: [...D.nrm] },
-        members: { up: [...D.mem].map(id => members.get(id)).filter(Boolean).map(pubMember), rm: [] },
+        members: { up: [...D.mem].map(id => members.get(id)).filter(Boolean).map(pubMember) },
       };
       if (D.mode) m.mode = sess.mode;
       D.add.clear(); D.up.clear(); D.rm.clear(); D.nup.clear(); D.nrm.clear(); D.mem.clear(); D.mode = false;
-      for (const p of peers.values()) if (p.member) p.c.send(m);
+      const s = JSON.stringify(m);
+      for (const p of peers.values()) if (p.member) tx(p.ctl, s);
     }
     let shown = false;
     // changes go out, and the page redraws, at most every 80 ms however many there are
@@ -1819,9 +1843,8 @@
     const memberChanged = id => { D.mem.add(id); dirty(); };
     const putNote = n => { notes.set(n.id, n); D.nrm.delete(n.id); D.nup.set(n.id, n); dirty(); };
     const dropNote = id => { notes.delete(id); D.nup.delete(id); D.nrm.add(id); dirty(); db.del('notes', id).catch(() => {}); };
-    const bury = id => {
-      tomb.delete(id);
-      tomb.add(id);
+    const bury = ids => {
+      for (const id of ids) { tomb.delete(id); tomb.add(id); }
       for (const k of tomb) { if (tomb.size <= TOMB_MAX) break; tomb.delete(k); }
       store.set(TOMB, [...tomb]);
     };
@@ -1830,22 +1853,26 @@
     // where added files go: their own path, unless someone else has something there:
     // then "report (bob).pdf", or for a folder added whole, "photos (bob)/…"
     function place(list, owner, dir) {
-      const name = nameOf(owner), seen = new Map(paths);
+      // names can hold "/" or "\\": every candidate is cleaned before it is compared, so
+      // a crafted name can never land on someone else's exact path
+      const name = nameOf(owner).replace(/[\\/]/g, '_'), seen = new Map(paths), tried = new Map();
       const clash = p => { const id = seen.get(p), o = id && items.get(id); return id && (!o || o.owner !== owner); };
-      const free = p => !seen.has(p) && ![...seen.keys()].some(k => k.startsWith(p + '/'));
+      const free = p => p && !seen.has(p) && ![...seen.keys()].some(k => k.startsWith(p + '/'));
       let from = null, to = null;
       if (dir && list.some(it => it.path.startsWith(dir + '/') && clash(it.path))) {
-        for (let n = 1; ; n++) { to = `${dir} (${name}${n > 1 ? ' ' + n : ''})`; if (free(to)) break; }
-        from = dir;
+        for (let n = 1; n < 1000; n++) { to = clean(`${dir} (${name}${n > 1 ? ' ' + n : ''})`); if (free(to)) break; to = null; }
+        if (to) from = dir;
       }
       return list.map(it => {
-        let p = from && it.path.startsWith(from + '/') ? to + it.path.slice(from.length) : it.path;
-        if (clash(p)) {
+        let p = clean(from && it.path.startsWith(from + '/') ? to + it.path.slice(from.length) : it.path);
+        if (p && clash(p)) {
           const i = p.lastIndexOf('/'), d = p.slice(0, i + 1), b = p.slice(i + 1), dot = b.lastIndexOf('.');
-          const stem = dot > 0 ? b.slice(0, dot) : b, ext = dot > 0 ? b.slice(dot) : '';
-          for (let n = 1; ; n++) { const c = `${d}${stem} (${name}${n > 1 ? ' ' + n : ''})${ext}`; if (!seen.has(c)) { p = c; break; } }
+          const stem = dot > 0 ? b.slice(0, dot) : b, ext = dot > 0 ? b.slice(dot) : '', k = d + stem + '\n' + ext;
+          // many of the same name in one batch: carry on counting, don't start over each time
+          let c = null;
+          for (let n = tried.get(k) || 1; n < 1e5; n++) { c = clean(`${d}${stem} (${name}${n > 1 ? ' ' + n : ''})${ext}`); if (c && !seen.has(c)) { tried.set(k, n + 1); break; } c = null; }
+          p = c;
         }
-        p = clean(p);
         if (p) seen.set(p, '-' + owner); // later ones in the batch see it (not an item: always a clash for others)
         return p;
       });
@@ -1855,22 +1882,25 @@
     // file stays on their disk; they're told. why: deleted (remembered, so it isn't
     // published again), one-way, replaced, gone (owner away too long / tab closed), pin
     function remove(list, by, why = 'deleted') {
-      const owners = new Map();
+      const owners = new Map(), gone = new Set(), stored = [], told = why === 'deleted' || why === 'one-way';
       for (const it of list) {
         if (!it || !items.has(it.id)) continue;
         dropItem(it.id);
-        if (it.kind === 'stored') db.del('items', it.id).catch(() => {});
-        else if (why === 'deleted' || why === 'one-way') { const o = owners.get(it.owner) || []; o.push(it.id); owners.set(it.owner, o); }
-        if (why === 'deleted' || why === 'one-way') bury(it.id);
-        stopFor(it.id, why === 'one-way' ? 'the host switched to one-way' : 'removed from the share');
+        gone.add(it.id);
+        if (it.kind === 'stored') stored.push(it.id);
+        else if (told) { const o = owners.get(it.owner) || []; o.push(it.id); owners.set(it.owner, o); }
       }
+      if (!gone.size) return;
+      if (stored.length) db.delAll('items', stored).catch(() => {});
+      if (told) bury(gone);
+      stopFor(gone, why === 'one-way' ? 'the host switched to one-way' : 'removed from the share');
       for (const [owner, ids] of owners) for (const p of peersOf(owner)) p.c.send({ t: 'unshared', ids, by, why });
       showStorage();
     }
     // transfers of something that's gone: what the host forwards, and its own downloads
-    function stopFor(id, why) {
-      for (const p of peers.values()) if (p.c) for (const s of [...p.c.serves.values()]) if (s.id === id) endServe(s, why);
-      for (const x of [...xfers]) if (x.id === id) x.finish(new Error(why));
+    function stopFor(ids, why) {
+      for (const p of peers.values()) if (p.c) for (const s of [...p.c.serves.values()]) if (ids.has(s.id)) endServe(s, why);
+      for (const x of [...xfers]) if (ids.has(x.id)) x.finish(new Error(why));
     }
 
     // ---- the host's own files: copied into this browser's storage
@@ -1947,7 +1977,6 @@
       items, notes, members, verb: 'upload',
       me: () => myId,
       writable: () => true,
-      offline: it => it.off || 0,
       hint: () => null,
       add: addStored,
       fetch: async (it, sink, prog, sig, waiting) => {
@@ -2012,7 +2041,7 @@
     // everyone in the share, host first, then who is here, then who isn't
     const peopleEl = el('span', {});
     const showPeople = () => {
-      const list = [...members.values()].filter(m => m.id === myId || online(m.id) || holds(m.id) || Date.now() - m.lastSeen < RESERVE)
+      const list = [...members.values()].filter(m => m.id === myId || Date.now() - m.lastSeen < RESERVE || online(m.id) || holds(m.id))
         .sort((a, b) => (b.id === myId) - (a.id === myId) || online(b.id) - online(a.id) || a.name.localeCompare(b.name));
       peopleEl.textContent = list.map(m => m.name + (m.id === myId ? ' (host)' : online(m.id) ? '' : ' (offline)')).join(' · ');
     };
@@ -2163,7 +2192,7 @@
         if (sess.mode !== 'rw') endServe(s, 'not found');
         else if (it.owner === p.member) endServe(s, 'not found');
         else if (it.off || !o || !o.member || !o.c) endServe(s, 'offline');
-        else proxyOpen(c, s, o.c, s.id);
+        else proxyOpen(s, o.c, s.id);
         return true;
       },
     });
@@ -2224,7 +2253,7 @@
     // signaling or the others. resolves to null if it can't be set up.
     function pipe(id) {
       return new Promise(res => {
-        const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+        const ws = new WebSocket(WS_URL());
         const end = ok => {
           clearTimeout(t);
           ws.onmessage = ws.onclose = null;
@@ -2245,9 +2274,9 @@
 
     // tabs from before names can't say hello: tell them to reload
     const OUTDATED = 'this share was updated — reload the page';
-    function outdated(p) {
+    function outdated(p, why = OUTDATED) {
       p.outdated = true;
-      tx(p.ctl, { t: 'err', e: OUTDATED });
+      tx(p.ctl, { t: 'err', e: why });
       setTimeout(() => drop(p.id), 300);
     }
     function waitHello(p) {
@@ -2277,17 +2306,18 @@
           p.hello = false;
           waitHello(p);
           return tx(p.ctl, { t: 'name-taken', suggest: suggest(name) });
-        } else members.set(id, mb = { id, secretHash, name, key, lastSeen: 0 });
+        } else if (members.size >= MEMBERS_MAX) return outdated(p, 'this share has too many people — ask the host for a new share');
+        else members.set(id, mb = { id, secretHash, name, key, lastSeen: 0 });
         mb.lastSeen = Date.now();
         keepMember(mb);
         p.member = id;
         // back again: what this tab still holds comes back online; what no tab holds any more goes
         for (const it of [...items.values()]) {
           if (it.owner !== id || it.kind !== 'ref') continue;
+          if (have.has(it.id)) { via.set(it.id, p.id); if (it.off) { it.off = 0; upItem(it); } continue; } // (even if its old connection isn't gone yet)
           const holder = peers.get(via.get(it.id));
           if (holder && holder !== p && holder.member) continue; // another tab of theirs has it
-          if (have.has(it.id)) { via.set(it.id, p.id); if (it.off) { it.off = 0; upItem(it); } }
-          else remove([it], null, 'gone');
+          remove([it], null, 'gone');
         }
         tx(p.ctl, { ...snap('welcome'), you: { id, name: mb.name } });
         memberChanged(id);
@@ -2327,20 +2357,24 @@
       if (xmsg(p.c, m)) return;
       const rw = sess.mode === 'rw';
       switch (m.t) {
-        case 'sync': return tx(p.ctl, snap('snap'));
+        case 'sync': // one at a time: a guest asking in a loop gets no more than it can read
+          if (p.ctl.txn) return;
+          return tx(p.ctl, snap('snap'));
         case 'away': return drop(p.id); // its tab is closing
         case 'add': {
-          if (!rw) return tx(p.ctl, { t: 'added', paths: {}, no: arr(m.items).map(x => x && x.id).filter(id => ITEM.test(id)).slice(0, ITEMS_MAX) });
+          if (!rw) return tx(p.ctl, { t: 'added', no: arr(m.items).map(x => x && x.id).filter(id => ITEM.test(id)).slice(0, ITEMS_MAX) });
           const ok = [], no = [];
           let count = [...items.values()].filter(it => it.owner === p.member).length;
-          for (const x of arr(m.items).slice(0, ITEMS_MAX)) {
+          const all = arr(m.items);
+          for (const x of all.slice(ITEMS_MAX)) if (x && ITEM.test(x.id)) no.push(x.id);
+          for (const x of all.slice(0, ITEMS_MAX)) {
             if (!x || !ITEM.test(x.id)) continue;
             const path = clean(x.path), cur = items.get(x.id);
             if (!path || !Number.isSafeInteger(x.size) || x.size < 0 || (x.fp != null && !HASH.test(x.fp)) || tomb.has(x.id) || (cur && cur.owner !== p.member) || (!cur && count >= ITEMS_MAX)) { no.push(x.id); continue; }
             if (!cur) count++;
             ok.push({ id: x.id, path, size: x.size, mtime: Number.isSafeInteger(x.mtime) ? x.mtime : 0, fp: x.fp || null });
           }
-          const where = place(ok, p.member, typeof m.dir === 'string' ? clean(m.dir) : null), out = {};
+          const where = place(ok, p.member, typeof m.dir === 'string' ? clean(m.dir) : null);
           ok.forEach((x, k) => {
             const path = where[k];
             if (!path) return no.push(x.id);
@@ -2351,9 +2385,8 @@
             if (cur && cur.path !== path && paths.get(cur.path) === cur.id) paths.delete(cur.path);
             via.set(x.id, p.id);
             putItem({ ...x, path, owner: p.member, kind: 'ref', off: 0 });
-            out[x.id] = path;
           });
-          return tx(p.ctl, { t: 'added', paths: out, no });
+          return tx(p.ctl, { t: 'added', no });
         }
         case 'rm': {
           if (!rw) return;
@@ -2636,7 +2669,6 @@
       if (mode === 'ro' && mine.size) {
         // the host is not on our direct links, so we stop serving ourselves
         mine.clear();
-        closeLinks();
         if (was === 'rw') say('the host switched to one-way — your shared files were removed');
       }
       if (mode === 'ro') closeLinks();
@@ -2664,7 +2696,6 @@
       for (const x of arr(nt.up)) { const o = okNote(x); if (o) notes.set(o.id, o); }
       for (const id of arr(nt.rm)) notes.delete(id);
       for (const x of arr(mb.up)) { const o = okMember(x); if (o) members.set(o.id, o); }
-      for (const id of arr(mb.rm)) members.delete(id);
       if (m.mode) setMode(m.mode);
     }
     function showState() {
@@ -2692,23 +2723,23 @@
           showState();
           for (const o of outbox.splice(0)) tx(ctl, o);
           kick(xfers);
-          return v.refresh();
+          return redraw();
         case 'snap':
           if (!ready) return;
           snapshot(m);
           showState();
           kick(xfers);
-          return v.refresh();
+          return redraw();
         case 'delta':
           if (!ready) return;
           delta(m);
           showState();
           kick(xfers);
-          return v.refresh();
+          return redraw();
         case 'added':
           for (const id of arr(m.no)) mine.delete(id);
           if (arr(m.no).length) say(`${arr(m.no).length} file${arr(m.no).length === 1 ? '' : 's'} could not be shared`);
-          return v && v.refresh();
+          return redraw();
         // taken out of the share by someone (our file on disk is untouched)
         case 'unshared': {
           const ids = arr(m.ids).filter(id => mine.has(id)), gone = new Set(ids);
@@ -2719,7 +2750,7 @@
             const it = items.get(ids[0]);
             say(`${nameOf(m.by)} removed ${ids.length > 1 ? ids.length + ' of your files' : it ? it.path.split('/').pop() : 'a file of yours'}`);
           }
-          return v && v.refresh();
+          return redraw();
         }
         case 'peer-sig': return onPeerSig(m.from, m.data);
         case 'err':
@@ -2732,6 +2763,9 @@
       }
     }
 
+    // a burst of changes redraws the page once
+    let redrawT = null;
+    const redraw = () => { if (!redrawT) redrawT = setTimeout(() => { redrawT = null; if (v) v.refresh(); }, 30); };
     // notes and deletes made while reconnecting go out once connected again
     function post(m) {
       if (ready && ctl && ctl.readyState === 'open') return tx(ctl, m);
@@ -2804,6 +2838,7 @@
       let l = links.get(from);
       if (!l || l.dead) {
         if (!data.d || data.d.type !== 'offer') return;
+        if (!mine.size) return; // nothing of ours to fetch: no reason to show our addresses
         l = getLink(from, true);
         if (!l) return; // too many links: they'll go through the host
       }
@@ -2855,12 +2890,13 @@
       items, notes, members, verb: 'share',
       me: () => myId,
       writable: () => mode === 'rw',
-      offline: it => it.off || 0,
       hint: () => mine.size ? 'your files are shared from this tab — keep it open' : null,
       // two-way: only names and sizes go to the host; the bytes stay here until someone gets them
       add: async (list, sig, say, dir) => {
         const out = list.map(it => ({ id: newId(), path: it.path, size: it.f.size, mtime: Number.isSafeInteger(it.f.lastModified) ? it.f.lastModified : Date.now(), fp: it.fp }));
-        for (const o of out) for (const it of items.values()) if (it.path === o.path && it.owner === myId) mine.delete(it.id); // replaced
+        const own = new Map();
+        for (const it of items.values()) if (it.owner === myId) own.set(it.path, it.id);
+        for (const o of out) if (own.has(o.path)) mine.delete(own.get(o.path)); // replaced
         out.forEach((o, k) => mine.set(o.id, { f: list[k].f, meta: o }));
         post({ t: 'add', items: out, dir: dir || undefined });
         v.refresh();
@@ -2892,6 +2928,7 @@
 
   let current = null;
   function route(msg) {
+    if (view && view.stop) view.stop();
     if (cleanup) cleanup();
     cleanup = view = dropTo = pasteTo = onTabs = onKill = null;
     busy.clear();
