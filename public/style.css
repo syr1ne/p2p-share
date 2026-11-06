@@ -52,6 +52,10 @@ h2 { font: inherit; font-size: 12.5px; letter-spacing: .12em; text-transform: up
 .ls .empty { display: block; color: var(--mute); }
 .ls .acts { display: flex; gap: 8px; }
 .ls pre { grid-column: 1 / -1; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; padding: 4px 0 8px; }
+/* an owner who is away: their things stay listed, greyed, until they're back or the grace period ends */
+.ls li.off > :first-child { color: var(--mute); }
+button:disabled { opacity: .4; cursor: default; }
+@media (hover: hover) { button:disabled:hover { background: none; color: inherit; } }
 
 /* status line + progress; pinned to the bottom of the screen while something transfers */
 .foot.live { position: sticky; bottom: 0; z-index: 2; background: var(--bg); border-top: 1px solid var(--line); padding: 6px 0 max(6px, env(safe-area-inset-bottom)); }
