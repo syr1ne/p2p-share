@@ -117,6 +117,8 @@
   // relative, no "..", no control chars
   function clean(p) {
     if (typeof p !== 'string') return null;
+    // a lone surrogate (only ever from a hand-made message) can't be url-encoded
+    p = p.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '\ufffd');
     const parts = p.replace(/\\/g, '/').split('/').map(s => s.replace(/[\x00-\x1f\x7f]/g, '').trim()).filter(s => s && s !== '.' && s !== '..');
     const out = parts.join('/');
     return out && out.length <= 1024 && parts.length <= 32 ? out : null;
@@ -340,6 +342,8 @@
           };
         }
       };
+      // a tab still running an older version holds the database: it has to close first
+      r.onblocked = () => { p = null; rej(Object.assign(new Error('a tab with an older version of this site is open — close it, then reload this page'), { blocked: true })); };
       // a newer version in another tab needs this one to let go
       r.onsuccess = () => { r.result.onversionchange = () => { r.result.close(); p = null; }; res(r.result); };
       r.onerror = () => rej(r.error);
@@ -574,11 +578,23 @@
   //   gone(id)       a file we hand out can't be read any more
 
   const HDR = 12;
+  // SERVES_MAX files served at once, at most 2 of them to any one connection, so one
+  // requester can't hold every slot. a serve nobody asks anything of for a minute
+  // (a paused download, or someone squatting) gives its slot back
   let serving = 0;
-  const slots = [];
+  const slots = [], live = new Set();
   const serveSync = () => busy('serve', serving > 0); // owners keep the screen on while serving
-  const slot = () => serving < SERVES_MAX ? (serving++, serveSync(), Promise.resolve()) : new Promise(r => slots.push(r));
-  const unslot = () => { const next = slots.shift(); if (next) next(); else serving--; serveSync(); };
+  const slot = c => {
+    if (serving < SERVES_MAX && (c.slotted || 0) < 2) { serving++; c.slotted = (c.slotted || 0) + 1; serveSync(); return Promise.resolve(); }
+    return new Promise(r => slots.push({ c, r }));
+  };
+  const unslot = c => {
+    c.slotted--;
+    const i = slots.findIndex(w => (w.c.slotted || 0) < 2);
+    if (i >= 0) { const [w] = slots.splice(i, 1); w.c.slotted = (w.c.slotted || 0) + 1; w.r(); } else serving--;
+    serveSync();
+  };
+  setInterval(() => { const now = Date.now(); for (const s of live) if (!s.busy && !s.wants.length && now - s.last > 6e4) endServe(s, 'idle'); }, 15e3);
 
   function conn(ctl, bin, maxMsg, hooks) {
     return { ctl, bin, hooks, pulls: new Map(), serves: new Map(), xid: 0, max: Math.min(MSG, maxMsg || 65536) - HDR, used: Date.now(), send: m => tx(ctl, m) };
@@ -599,10 +615,16 @@
       case 'want': {
         const s = c.serves.get(m.xid);
         if (!s || !Number.isSafeInteger(m.off) || !Number.isSafeInteger(m.len) || m.len < 1 || m.len > 4 * WIN || m.off < 0) return true;
-        if (s.up) { tx(s.up.c.ctl, { t: 'want', xid: s.up.xid, off: m.off, len: m.len }); return true; } // forwarded, nothing kept
+        if (s.up) { // forwarded, nothing kept
+          if (s.fwd + m.len > INFLIGHT * WIN) { endServe(s, 'bad request'); return true; }
+          s.fwd += m.len;
+          (c.held || (c.held = [])).push({ s, off: m.off, len: m.len });
+          release(c);
+          return true;
+        }
         if (!s.src || m.off + m.len > s.src.size || s.wants.length >= 4 * INFLIGHT) { endServe(s, 'bad request'); return true; }
         s.wants.push({ off: m.off, len: m.len });
-        c.used = Date.now();
+        c.used = s.last = Date.now();
         pumpServe(s);
         return true;
       }
@@ -632,11 +654,13 @@
   async function serveOpen(c, m) {
     if (!u32(m.xid) || c.serves.has(m.xid)) return;
     if (c.serves.size >= 64 || !ITEM.test(m.id)) return c.send({ t: 'err', xid: m.xid, e: 'rejected' });
-    const s = { c, xid: m.xid, id: m.id, wants: [], open: true, src: null, up: null, slot: false };
+    const s = { c, xid: m.xid, id: m.id, wants: [], open: true, src: null, up: null, slot: false, last: Date.now(), fwd: 0 };
     c.serves.set(m.xid, s);
     if (c.hooks.proxy && c.hooks.proxy(c, s)) return;
-    await slot();
+    await slot(c);
     s.slot = true;
+    live.add(s);
+    s.last = Date.now();
     if (!s.open) return endServe(s);
     try { s.src = await c.hooks.resolve(c, m.id); } catch (e) { return endServe(s, (e && e.message) || 'not available'); }
     if (!s.open) return endServe(s);
@@ -648,7 +672,8 @@
     if (s.c.serves.get(s.xid) === s) s.c.serves.delete(s.xid);
     if (err && first) s.c.send({ t: 'err', xid: s.xid, e: err });
     if (s.up) { const u = s.up; s.up = null; if (u.c.pulls.get(u.xid)) { u.c.pulls.delete(u.xid); tx(u.c.ctl, { t: 'close', xid: u.xid }); } }
-    if (s.slot) { s.slot = false; unslot(); }
+    if (s.slot) { s.slot = false; live.delete(s); unslot(s.c); }
+    if (s.out) { s.c.fwdOut = Math.max(0, (s.c.fwdOut || 0) - s.out); s.out = 0; } // what won't arrive any more
   }
   const readAt = (s, w) => { const p = s.src.blob.slice(w.off, w.off + w.len).arrayBuffer(); p.catch(() => {}); return p; };
   // answer wants in order: read the next window while this one goes out
@@ -670,6 +695,7 @@
           if (c.bin.readyState !== 'open') return endServe(s);
           c.bin.send(frame(s.xid, w.off + i, buf.subarray(i, i + n)));
         }
+        s.last = Date.now();
         c.used = Date.now();
       }
     } catch {
@@ -686,6 +712,20 @@
     s.up = { c: upc, xid };
     upc.pulls.set(xid, { down: s, xid });
     upc.send({ t: 'open', xid, id });
+  }
+  // pass forwarded wants upstream only while little waits on the guest's connection:
+  // whatever the owners send then always fits (chrome closes a channel past 16 MB)
+  function release(d) {
+    clearTimeout(d.heldT);
+    while (d.held.length) {
+      const h = d.held[0];
+      if (!h.s.open || !h.s.up) { d.held.shift(); continue; }
+      if (d.bin.bufferedAmount + (d.fwdOut || 0) + h.len > 8 << 20) { d.heldT = setTimeout(() => release(d), 25); return; }
+      d.held.shift();
+      d.fwdOut = (d.fwdOut || 0) + h.len;
+      h.s.out = (h.s.out || 0) + h.len; // asked upstream, not yet arrived
+      tx(h.s.up.c.ctl, { t: 'want', xid: h.s.up.xid, off: h.off, len: h.len });
+    }
   }
   function endProxy(a, err) {
     const s = a.down;
@@ -744,11 +784,17 @@
     if (a.down) { // forward with the guest's own transfer id, in pieces its connection takes
       const s = a.down, d = s.c, body = new Uint8Array(buf, HDR);
       if (!s.open || d.bin.readyState !== 'open') return;
-      if (body.length <= d.max) {
-        new DataView(buf).setUint32(0, s.xid);
-        return d.bin.send(buf);
-      }
-      for (let i = 0; i < body.length; i += d.max) d.bin.send(frame(s.xid, off + i, body.subarray(i, i + d.max)));
+      // never more than was asked for
+      if (body.length > s.fwd) return endServe(s, 'bad data from the other side');
+      s.fwd -= body.length;
+      s.out = Math.max(0, (s.out || 0) - body.length);
+      d.fwdOut = Math.max(0, (d.fwdOut || 0) - body.length);
+      try {
+        if (body.length <= d.max) {
+          new DataView(buf).setUint32(0, s.xid);
+          d.bin.send(buf);
+        } else for (let i = 0; i < body.length; i += d.max) d.bin.send(frame(s.xid, off + i, body.subarray(i, i + d.max)));
+      } catch { endServe(s, 'offline'); }
       return;
     }
     const x = a.x, w = a.wins[0], n = buf.byteLength - HDR;
@@ -1617,7 +1663,7 @@
   function download(it, sink, prog, sig, waiting, route, xfers) {
     return new Promise((res, rej) => {
       if (sig.aborted) return rej(sig.reason);
-      const x = { id: it.id, got: 0, size: null, mtime: null, sink, prog, att: null, parked: false, waitFor: '' };
+      const x = { id: it.id, got: 0, size: it.size, mtime: null, sink, prog, att: null, parked: false, waitFor: '' };
       x.finish = err => {
         if (!xfers.delete(x)) return;
         clearTimeout(x.retry);
@@ -1625,7 +1671,7 @@
         err ? rej(err) : res();
       };
       x.failed = (err, fatal) => {
-        if (fatal || (err && err !== 'offline')) return x.finish(new Error(err || 'failed'));
+        if (fatal || (err && err !== 'offline' && err !== 'idle')) return x.finish(new Error(err || 'failed'));
         clearTimeout(x.retry);
         x.retry = setTimeout(x.go, err ? 1000 : 300); // connection went, or the owner just did: look again shortly
       };
@@ -1665,6 +1711,8 @@
     // recently deleted ids, so a guest coming back doesn't publish them again
     const TOMB = 'p2p:tomb:' + sess.slug, tomb = new Set(arr(store.get(TOMB)).filter(id => ITEM.test(id)));
     const unfp = [];
+    const opened = await db.all('notes').then(() => null, e => e);
+    if (opened && opened.blocked) return app.replaceChildren(el('h1', {}, el('a', { href: '/' }, 'p2p'), ' /' + sess.slug), el('p', { class: 'status' }, opened.message));
     try {
       for (const m of await db.all('members')) {
         const name = normName(m.name);
@@ -2637,11 +2685,11 @@
           myId = m.you.id;
           myname = normName(m.you.name) || myname;
           remember();
+          // first listing on this connection: carry on with whatever was going before
+          ready = true;
           snapshot(m);
           show();
           showState();
-          // first listing on this connection: carry on with whatever was going before
-          ready = true;
           for (const o of outbox.splice(0)) tx(ctl, o);
           kick(xfers);
           return v.refresh();
@@ -2663,8 +2711,9 @@
           return v && v.refresh();
         // taken out of the share by someone (our file on disk is untouched)
         case 'unshared': {
-          const ids = arr(m.ids).filter(id => mine.has(id));
+          const ids = arr(m.ids).filter(id => mine.has(id)), gone = new Set(ids);
           for (const id of ids) mine.delete(id);
+          for (const c of [hostC, ...[...links.values()].map(l => l.c)]) if (c) for (const s of [...c.serves.values()]) if (m.why === 'one-way' || gone.has(s.id)) endServe(s, 'removed from the share');
           if (m.why === 'one-way') { mine.clear(); closeLinks(); say('the host switched to one-way — your shared files were removed'); }
           else if (ids.length && m.by !== myId) {
             const it = items.get(ids[0]);

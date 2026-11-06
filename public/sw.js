@@ -29,6 +29,7 @@ self.addEventListener('message', e => {
 
 // rfc 5987 / 6266: utf-8 name, plus a plain fallback for old clients
 function disposition(name) {
+  name = name.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '\ufffd');
   const star = encodeURIComponent(name).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
   const plain = name.replace(/[^\x20-\x7e]|["\\%]/g, '_');
   return `attachment; filename="${plain}"; filename*=UTF-8''${star}`;
