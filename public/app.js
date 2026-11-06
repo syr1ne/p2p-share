@@ -7,7 +7,14 @@
   // send buffer: refill below LOW, pause above HIGH (chrome closes a channel past 16 MB).
   // MSG: largest data channel message we send, when the other side accepts it
   const LOW = 2 << 20, HIGH = 8 << 20, PART = 8000, MSG = 256 << 10;
-  const TITLE_MAX = 100, NOTE_MAX = 100000, NOTES_MAX = 200;
+  // downloads ask for WIN bytes at a time, INFLIGHT windows ahead (see the wire format)
+  const WIN = 1 << 20, INFLIGHT = 4;
+  const TITLE_MAX = 100, NOTE_MAX = 100000, NOTES_MAX = 200, NOTES_PER = 50, ITEMS_MAX = 10000, TOMB_MAX = 2000;
+  // an owner's things wait this long after they go offline (tests may shorten it)
+  const grace = () => +window.__p2pGrace || 10 * 6e4;
+  // links between guests: at most LINKS_MAX each, closed after LINK_IDLE unused; a link
+  // not open after DIRECT_WAIT goes through the host instead. SERVES_MAX files served at once
+  const LINKS_MAX = 8, LINK_IDLE = 2 * 6e4, DIRECT_WAIT = 6000, SERVES_MAX = 4;
   const ZIP_MAX = 0xffffffff; // no zip64: 4 GB per folder download
   const app = document.getElementById('app');
 
@@ -309,18 +316,30 @@
     return out.sort();
   };
 
-  // indexeddb, keyed [share, path] / [share, note id] / [share, member id].
+  // indexeddb, keyed [share, item id] / [share, note id] / [share, member id].
   // upgrades keep what is there: hosts must never lose files to a new version
   const idb = (() => {
     let p;
     const open = () => p || (p = new Promise((res, rej) => {
-      const r = indexedDB.open('p2p', 3);
+      const r = indexedDB.open('p2p', 4);
       r.onupgradeneeded = e => {
-        const d = r.result;
+        const d = r.result, t = r.transaction;
         if (e.oldVersion < 2) for (const n of [...d.objectStoreNames]) d.deleteObjectStore(n); // (v1 layouts are long gone)
-        if (!d.objectStoreNames.contains('files')) d.createObjectStore('files', { keyPath: ['slug', 'path'] });
         if (!d.objectStoreNames.contains('notes')) d.createObjectStore('notes', { keyPath: ['slug', 'id'] });
         if (!d.objectStoreNames.contains('members')) d.createObjectStore('members', { keyPath: ['slug', 'id'] });
+        if (!d.objectStoreNames.contains('items')) d.createObjectStore('items', { keyPath: ['slug', 'id'] });
+        // v2/v3 kept files by path: each gets an id (transfers address items by id) and
+        // moves over, in this same transaction. old hashes go; fingerprints are made later
+        if (d.objectStoreNames.contains('files')) {
+          const items = t.objectStore('items'), q = t.objectStore('files').openCursor();
+          q.onsuccess = () => {
+            const c = q.result;
+            if (!c) return d.deleteObjectStore('files');
+            const f = c.value;
+            if (f && f.blob) items.put({ slug: f.slug, id: newId(), path: f.path, mtime: f.mtime, fp: null, blob: f.blob });
+            c.continue();
+          };
+        }
       };
       // a newer version in another tab needs this one to let go
       r.onsuccess = () => { r.result.onversionchange = () => { r.result.close(); p = null; }; res(r.result); };
@@ -352,14 +371,46 @@
         patch: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { const v = q.result && fn(q.result); if (v) o.put(v); }; }),
         delIf: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { if (q.result && fn(q.result)) o.delete([slug, k]); }; }),
         delPrefix: (s, pre) => run(s, 'readwrite', o => o.delete(IDBKeyRange.bound([slug, pre], [slug, pre + '\uffff']))),
-        clear: () => Promise.all(['files', 'notes', 'members'].map(s => run(s, 'readwrite', o => o.delete(every)))),
+        clear: () => Promise.all(['items', 'notes', 'members'].map(s => run(s, 'readwrite', o => o.delete(every)))),
       };
     };
   })();
 
   // ---- wire format --------------------------------------------------------
-  // json messages are strings (split into parts when large).
-  // binary frames are [u32 request id][bytes].
+  //
+  // every connection (guest↔host, and guest↔guest "links") has two ordered
+  // channels: ctl carries json strings, bin carries file bytes. control messages
+  // (cancel, listing changes, notes, signaling) never queue behind file data.
+  // json messages over PART characters are split into { t: '+', d, end } parts.
+  //
+  // joining (guest → host, first message on ctl):
+  //   hello { v: 3, name, secret, have: [ids] }   secret: per-share, see shareSecret
+  //   ← welcome { you: { id, name }, v, mode, rev, members, items, notes, tomb }
+  //   ← name-taken { suggest }
+  // after that the host sends changes, numbered:
+  //   ← delta { rev, items: { add, up, rm }, notes: { up, rm }, members: { up, rm }, mode? }
+  //   a guest that misses a rev asks: sync {} → ← snap { …same as welcome }
+  // items: { id, path, size, mtime, fp, owner, kind: 'stored'|'ref', off }
+  //   stored: bytes in the host's indexeddb; ref: bytes in the owner's open tab.
+  //   off: when the owner went offline (0 = online)
+  // guest → host: add { items: [{ id, path, size, mtime, fp }], dir? }  ← added { paths: { id: path }, no: [ids] }
+  //               rm { ids } | rm { path, dir: true }, note { title, text, id? }, unnote { id }
+  //               peer-sig { to: member, data }  → forwarded as peer-sig { from: member, data }
+  // host → owner: unshared { ids, by, why: 'deleted'|'one-way' }
+  // host → guest: bye { why }, err { e }
+  //
+  // files are pulled, the same way on every connection. the requester:
+  //   open { xid, id }        ← meta { xid, size, mtime }  or  ← err { xid, e }
+  //   want { xid, off, len }  windows of WIN bytes, at most INFLIGHT outstanding
+  //   close { xid }           done or cancelled
+  // the owner answers each want on bin, in order, with frames
+  //   [u32 xid][u32 offset high][u32 offset low][bytes]   (≤ min(256 KiB, max message) - 12)
+  // and checks before every chunk that the transfer is still open. the requester
+  // only accepts bytes that continue the oldest outstanding window, and never more
+  // than size. resuming after a reconnect is open again + want from the last byte.
+  // pulling (rather than the owner pushing) bounds what anyone holds in flight to
+  // INFLIGHT × WIN per transfer, which is what lets the host forward bytes between
+  // two guests without storing them, and lets a slow disk or stream set the pace.
 
   function tx(dc, m) {
     if (!dc || dc.readyState !== 'open') return;
@@ -368,6 +419,7 @@
     for (let i = 0; i < s.length; i += PART) dc.send(JSON.stringify({ t: '+', d: s.slice(i, i + PART), end: i + PART >= s.length }));
   }
   function rx(st, raw) {
+    if (typeof raw !== 'string') return null;
     let m;
     try { m = JSON.parse(raw); } catch { return null; }
     if (!m || typeof m !== 'object') return null;
@@ -382,50 +434,41 @@
   }
   // wait for room in the send buffer. the relay has no event for that, and a channel
   // closed along with its connection doesn't always fire one either
-  const drain = dc => new Promise(r => {
+  const drain = (dc, low = LOW) => new Promise(r => {
     const done = () => {
       clearInterval(t);
       if (!dc.relay) { dc.removeEventListener('bufferedamountlow', done); dc.removeEventListener('close', done); }
       r();
     };
-    const t = setInterval(() => (dc.readyState !== 'open' || dc.bufferedAmount < LOW) && done(), dc.relay ? 25 : 1000);
+    const t = setInterval(() => (dc.readyState !== 'open' || dc.bufferedAmount < low) && done(), dc.relay ? 25 : 1000);
     if (!dc.relay) { dc.addEventListener('bufferedamountlow', done); dc.addEventListener('close', done); }
   });
-  // send blob from byte off on. the file is read 2 MB at a time, the next slice while
-  // this one goes out, in the largest messages the other side takes. prog gets the
-  // bytes that left the send buffer. true when all was sent, false when stop() said
-  // to quit; throws if the connection goes
-  async function stream(pc, dc, req, blob, prog, stop, off = 0) {
-    const n = Math.min(MSG, (pc.sctp && pc.sctp.maxMessageSize) || 65536) - 4;
-    const step = Math.max(1, Math.floor((2 << 20) / n)) * n;
-    const read = o => { const p = blob.slice(o, o + step).arrayBuffer(); p.catch(() => {}); return p; };
-    let next = off < blob.size ? read(off) : null;
-    for (let o = off; o < blob.size; o += step) {
-      const buf = new Uint8Array(await next);
-      next = o + step < blob.size ? read(o + step) : null;
-      for (let i = 0; i < buf.length; i += n) {
-        if (dc.bufferedAmount > HIGH) await drain(dc);
-        if (stop && stop()) return false;
-        if (dc.readyState !== 'open') throw new Error('disconnected');
-        const part = buf.subarray(i, i + n), frame = new Uint8Array(part.length + 4);
-        new DataView(frame.buffer).setUint32(0, req);
-        frame.set(part, 4);
-        dc.send(frame);
-        if (prog) prog(Math.max(0, o + i + part.length - dc.bufferedAmount));
-      }
-    }
-    return true;
+  const u32 = n => Number.isSafeInteger(n) && n >= 1 && n <= 0xffffffff;
+  const ITEM = /^[a-z0-9]{12}$/;
+  // the two channels of a webrtc connection, set up the same way on both ends (negotiated)
+  function chans(pc) {
+    const ctl = pc.createDataChannel('ctl', { negotiated: true, id: 0, ordered: true });
+    const bin = pc.createDataChannel('bin', { negotiated: true, id: 1, ordered: true });
+    for (const c of [ctl, bin]) { c.binaryType = 'arraybuffer'; c.bufferedAmountLowThreshold = LOW; }
+    return { ctl, bin };
   }
+  const bothOpen = ({ ctl, bin }) => new Promise(r => {
+    const check = () => ctl.readyState === 'open' && bin.readyState === 'open' && r();
+    ctl.addEventListener('open', check);
+    bin.addEventListener('open', check);
+    check();
+  });
 
   // ---- relay ---------------------------------------------------------------
   // fallback for when the browsers can't reach each other directly: frames go
   // through the signaling server, end-to-end encrypted with aes-gcm under a key
   // from an ecdh exchange done during the handshake. the server only sees
-  // ciphertext. quacks like an RTCDataChannel so the rest of the code doesn't care.
+  // ciphertext. one socket carries both channels: the first byte of each
+  // (encrypted) frame says which, and queued ctl frames go out before bin ones.
 
   const subtle = window.crypto && crypto.subtle;
   const ECDH = { name: 'ECDH', namedCurve: 'P-256' };
-  const RELAY_PC = { sctp: { maxMessageSize: 65536 } }; // + headers, well under the server's 128 KB cap
+  const RELAY_MAX = 65536; // per message, + headers: well under the server's 128 KB cap
   const enc = new TextEncoder(), dec = new TextDecoder();
   const b64 = u8 => btoa(String.fromCharCode(...u8));
   async function keypair() {
@@ -437,7 +480,8 @@
     const k = await subtle.importKey('raw', Uint8Array.from(atob(pub), c => c.charCodeAt(0)), ECDH, false, []);
     const bits = await subtle.deriveBits({ name: 'ECDH', public: k }, kp.priv, 256);
     const ikm = await subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
-    return subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: enc.encode('p2p relay v1') }, ikm, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    // v2: two channels per frame; a v1 peer can't decrypt these, nor these theirs
+    return subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: enc.encode('p2p relay v2') }, ikm, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
   }
   // nonce = [sender side][0 0 0][u64 counter]: never reused, and the receiver
   // only accepts the exact next counter, so frames can't be replayed,
@@ -450,37 +494,291 @@
     return iv;
   };
   class Relay {
-    // side: 0 guest, 1 host
+    // side: 0 guest, 1 host. out(ciphertext) sends on the socket, buffered() is its backlog
     constructor(key, side, out, buffered) {
-      Object.assign(this, { key, side, out, buffered, relay: true, readyState: 'open', queued: 0, sent: 0, got: 0, tx: Promise.resolve(), rx: Promise.resolve(), onmessage: null, onclose: null });
+      Object.assign(this, { key, side, out, buffered, readyState: 'open', q: [[], []], qb: [0, 0], sent: 0, got: 0, busy: false, rx: Promise.resolve(), onclose: null });
+      const r = this;
+      const ch = c => ({
+        relay: true, onmessage: null, onclose: null,
+        get readyState() { return r.readyState; },
+        // file bytes count what waits on the socket too: that's what drain() waits on
+        get bufferedAmount() { return r.qb[c] + (c ? r.buffered() : 0); },
+        send: d => r.send(c, d),
+        close: () => r.close(),
+        addEventListener() {}, removeEventListener() {},
+      });
+      this.ctl = ch(0);
+      this.bin = ch(1);
     }
-    get bufferedAmount() { return this.queued + this.buffered(); }
-    send(data) {
+    send(c, data) {
       if (this.readyState !== 'open') return;
-      const str = typeof data === 'string';
-      const body = str ? enc.encode(data) : new Uint8Array(data.buffer || data, data.byteOffset || 0, data.byteLength);
+      const body = c ? new Uint8Array(data.buffer || data, data.byteOffset || 0, data.byteLength) : enc.encode(data);
       const frame = new Uint8Array(body.length + 1);
-      frame[0] = str ? 0 : 1;
+      frame[0] = c;
       frame.set(body, 1);
-      this.queued += frame.length;
-      this.tx = this.tx.then(async () => {
-        const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: nonce(this.side, this.sent++) }, this.key, frame));
-        this.queued -= frame.length;
-        if (this.readyState === 'open') this.out(ct);
-      }).catch(() => this.close());
+      this.q[c].push(frame);
+      this.qb[c] += frame.length;
+      this.pump();
+    }
+    // one at a time (the nonce counter is the order). file bytes only go to the socket
+    // while its backlog is small, so a control frame never waits behind much
+    async pump() {
+      if (this.busy) return;
+      this.busy = true;
+      try {
+        while (this.readyState === 'open') {
+          const c = this.q[0].length ? 0 : this.q[1].length ? 1 : -1;
+          if (c < 0) break;
+          if (c && this.buffered() > 256 << 10) { await new Promise(r => setTimeout(r, 10)); continue; }
+          const f = this.q[c].shift();
+          const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: nonce(this.side, this.sent++) }, this.key, f));
+          this.qb[c] -= f.length;
+          if (this.readyState === 'open') this.out(ct);
+        }
+      } catch { this.close(); }
+      this.busy = false;
     }
     receive(buf) {
       this.rx = this.rx.then(async () => {
         if (this.readyState !== 'open') return;
         const pt = new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv: nonce(1 - this.side, this.got++) }, this.key, buf));
-        if (this.onmessage) this.onmessage({ data: pt[0] ? pt.slice(1).buffer : dec.decode(pt.subarray(1)) });
+        const ch = pt[0] ? this.bin : this.ctl;
+        if (ch.onmessage) ch.onmessage({ data: pt[0] ? pt.buffer.slice(1) : dec.decode(pt.subarray(1)) });
       }).catch(() => this.close()); // tampered or wrong key
     }
     close() {
       if (this.readyState === 'closed') return;
       this.readyState = 'closed';
+      this.q = [[], []];
+      for (const ch of [this.ctl, this.bin]) if (ch.onclose) ch.onclose();
       if (this.onclose) this.onclose();
     }
+  }
+
+  // ---- moving files: pull on one side, serve on the other --------------------
+  // conn(): one end of a connection. hooks:
+  //   resolve(c, id) → { blob, size, mtime }  what this end hands out (throws a message if not)
+  //   proxy(c, m)    → true if it forwarded the open (the host, for items in other guests' tabs)
+  //   gone(id)       a file we hand out can't be read any more
+
+  const HDR = 12;
+  let serving = 0;
+  const slots = [];
+  const serveSync = () => busy('serve', serving > 0); // owners keep the screen on while serving
+  const slot = () => serving < SERVES_MAX ? (serving++, serveSync(), Promise.resolve()) : new Promise(r => slots.push(r));
+  const unslot = () => { const next = slots.shift(); if (next) next(); else serving--; serveSync(); };
+
+  function conn(ctl, bin, maxMsg, hooks) {
+    return { ctl, bin, hooks, pulls: new Map(), serves: new Map(), xid: 0, max: Math.min(MSG, maxMsg || 65536) - HDR, used: Date.now(), send: m => tx(ctl, m) };
+  }
+  function frame(xid, off, bytes) {
+    const f = new Uint8Array(HDR + bytes.length), v = new DataView(f.buffer);
+    v.setUint32(0, xid);
+    v.setUint32(4, Math.floor(off / 2 ** 32));
+    v.setUint32(8, off >>> 0);
+    f.set(bytes, HDR);
+    return f;
+  }
+
+  // a transfer message from c: true if handled
+  function xmsg(c, m) {
+    switch (m.t) {
+      case 'open': serveOpen(c, m); return true;
+      case 'want': {
+        const s = c.serves.get(m.xid);
+        if (!s || !Number.isSafeInteger(m.off) || !Number.isSafeInteger(m.len) || m.len < 1 || m.len > 4 * WIN || m.off < 0) return true;
+        if (s.up) { tx(s.up.c.ctl, { t: 'want', xid: s.up.xid, off: m.off, len: m.len }); return true; } // forwarded, nothing kept
+        if (!s.src || m.off + m.len > s.src.size || s.wants.length >= 4 * INFLIGHT) { endServe(s, 'bad request'); return true; }
+        s.wants.push({ off: m.off, len: m.len });
+        c.used = Date.now();
+        pumpServe(s);
+        return true;
+      }
+      case 'close': {
+        const s = c.serves.get(m.xid);
+        if (s) endServe(s);
+        return true;
+      }
+      case 'meta': case 'err': {
+        if (!u32(m.xid)) return m.t === 'meta';
+        const a = c.pulls.get(m.xid);
+        if (!a) return true; // late answer to something already closed
+        if (a.down) { // forwarding for another guest
+          if (m.t === 'err') { endProxy(a, String(m.e).slice(0, 100)); return true; }
+          if (Number.isSafeInteger(m.size) && m.size >= 0) tx(a.down.c.ctl, { t: 'meta', xid: a.down.xid, size: m.size, mtime: +m.mtime || 0 });
+          return true;
+        }
+        if (m.t === 'err') attemptFailed(a, String(m.e).slice(0, 100));
+        else gotMeta(a, m);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // ---- serving
+  async function serveOpen(c, m) {
+    if (!u32(m.xid) || c.serves.has(m.xid)) return;
+    if (c.serves.size >= 64 || !ITEM.test(m.id)) return c.send({ t: 'err', xid: m.xid, e: 'rejected' });
+    const s = { c, xid: m.xid, id: m.id, wants: [], open: true, src: null, up: null, slot: false };
+    c.serves.set(m.xid, s);
+    if (c.hooks.proxy && c.hooks.proxy(c, s)) return;
+    await slot();
+    s.slot = true;
+    if (!s.open) return endServe(s);
+    try { s.src = await c.hooks.resolve(c, m.id); } catch (e) { return endServe(s, (e && e.message) || 'not available'); }
+    if (!s.open) return endServe(s);
+    c.send({ t: 'meta', xid: s.xid, size: s.src.size, mtime: s.src.mtime });
+  }
+  function endServe(s, err) {
+    const first = s.open;
+    s.open = false;
+    if (s.c.serves.get(s.xid) === s) s.c.serves.delete(s.xid);
+    if (err && first) s.c.send({ t: 'err', xid: s.xid, e: err });
+    if (s.up) { const u = s.up; s.up = null; if (u.c.pulls.get(u.xid)) { u.c.pulls.delete(u.xid); tx(u.c.ctl, { t: 'close', xid: u.xid }); } }
+    if (s.slot) { s.slot = false; unslot(); }
+  }
+  const readAt = (s, w) => { const p = s.src.blob.slice(w.off, w.off + w.len).arrayBuffer(); p.catch(() => {}); return p; };
+  // answer wants in order: read the next window while this one goes out
+  async function pumpServe(s) {
+    if (s.busy) return;
+    s.busy = true;
+    const { c } = s, n = c.max;
+    let next = null;
+    try {
+      while (s.open && s.wants.length) {
+        const w = s.wants[0];
+        const buf = new Uint8Array(await (next || readAt(s, w)));
+        next = s.wants[1] ? readAt(s, s.wants[1]) : null;
+        s.wants.shift();
+        if (buf.length !== w.len) throw new Error('short read');
+        for (let i = 0; i < buf.length; i += n) {
+          if (c.bin.bufferedAmount > HIGH) await drain(c.bin);
+          if (!s.open) return;
+          if (c.bin.readyState !== 'open') return endServe(s);
+          c.bin.send(frame(s.xid, w.off + i, buf.subarray(i, i + n)));
+        }
+        c.used = Date.now();
+      }
+    } catch {
+      // moved, changed or deleted on disk since it was shared
+      if (s.open) { endServe(s, 'the file can no longer be read'); if (c.hooks.gone) c.hooks.gone(s.id); }
+    } finally { s.busy = false; }
+  }
+
+  // ---- forwarding (the host, between two guests that can't link directly)
+  // to the owner we are the requester, to the guest the owner; only wants the guest
+  // sends go upstream, so no more than INFLIGHT windows per transfer are ever in flight here
+  function proxyOpen(down, s, upc, id) {
+    const xid = upc.xid = (upc.xid % 0xffffffff) + 1;
+    s.up = { c: upc, xid };
+    upc.pulls.set(xid, { down: s, xid });
+    upc.send({ t: 'open', xid, id });
+  }
+  function endProxy(a, err) {
+    const s = a.down;
+    if (s.up && s.up.c.pulls.get(s.up.xid) === a) s.up.c.pulls.delete(s.up.xid);
+    s.up = null;
+    endServe(s, err);
+  }
+  // connection gone: close what was forwarded through it, both ways
+  function connClosed(c, why) {
+    for (const s of [...c.serves.values()]) endServe(s);
+    for (const [xid, a] of [...c.pulls]) {
+      c.pulls.delete(xid);
+      if (a.down) endProxy(a, 'offline');
+      else attemptFailed(a, null);
+    }
+  }
+
+  // ---- pulling
+  // x (one download, across reconnects and routes): { id, got, size, mtime, sink, prog, att }
+  // a (one attempt over one connection): { c, x, xid, wins, next }
+  function attempt(c, x) {
+    const xid = c.xid = (c.xid % 0xffffffff) + 1;
+    const a = { c, x, xid, wins: [], next: x.got, meta: false };
+    c.pulls.set(xid, a);
+    x.att = a;
+    c.used = Date.now();
+    c.send({ t: 'open', xid, id: x.id });
+  }
+  function gotMeta(a, m) {
+    const x = a.x;
+    if (!Number.isSafeInteger(m.size) || m.size < 0) return attemptFailed(a, 'bad answer');
+    const mtime = Number.isSafeInteger(m.mtime) ? m.mtime : 0;
+    if (x.size != null && (m.size !== x.size || (x.mtime && mtime !== x.mtime))) return attemptFailed(a, 'the file changed — get it again');
+    x.size = m.size;
+    x.mtime = mtime;
+    a.meta = true;
+    if (x.got >= x.size) return pullDone(a);
+    fill(a);
+  }
+  function fill(a) {
+    const x = a.x;
+    while (a.wins.length < INFLIGHT && a.next < x.size) {
+      const len = Math.min(WIN, x.size - a.next);
+      a.wins.push({ at: a.next, end: a.next + len });
+      a.c.send({ t: 'want', xid: a.xid, off: a.next, len });
+      a.next += len;
+    }
+  }
+  // bytes on bin: for one of our pulls, or (host) to forward
+  function onFrame(c, buf) {
+    if (!(buf instanceof ArrayBuffer) || buf.byteLength <= HDR) return;
+    const v = new DataView(buf), xid = v.getUint32(0), off = v.getUint32(4) * 2 ** 32 + v.getUint32(8);
+    const a = c.pulls.get(xid);
+    if (!a) return; // closed meanwhile
+    if (a.down) { // forward with the guest's own transfer id, in pieces its connection takes
+      const s = a.down, d = s.c, body = new Uint8Array(buf, HDR);
+      if (!s.open || d.bin.readyState !== 'open') return;
+      if (body.length <= d.max) {
+        new DataView(buf).setUint32(0, s.xid);
+        return d.bin.send(buf);
+      }
+      for (let i = 0; i < body.length; i += d.max) d.bin.send(frame(s.xid, off + i, body.subarray(i, i + d.max)));
+      return;
+    }
+    const x = a.x, w = a.wins[0], n = buf.byteLength - HDR;
+    if (x.att !== a) return;
+    if (!a.meta || !w || off !== w.at || off + n > w.end) return attemptFailed(a, 'bad data from the other side', true);
+    x.sink.write(new Uint8Array(buf, HDR), off);
+    w.at += n;
+    x.got = w.at;
+    c.used = Date.now();
+    if (x.prog) x.prog(x.got);
+    if (w.at === w.end) { a.wins.shift(); fill(a); }
+    if (x.got === x.size) pullDone(a);
+  }
+  function pullDone(a) {
+    const x = a.x;
+    if (a.c.pulls.get(a.xid) === a) { a.c.pulls.delete(a.xid); a.c.send({ t: 'close', xid: a.xid }); }
+    x.att = null;
+    x.finish(null);
+  }
+  // err null: the connection went (try again, maybe another way); fatal: don't retry
+  function attemptFailed(a, err, fatal) {
+    const x = a.x;
+    if (a.c.pulls.get(a.xid) === a) { a.c.pulls.delete(a.xid); if (err) a.c.send({ t: 'close', xid: a.xid }); }
+    if (x.att !== a) return;
+    x.att = null;
+    x.failed(err, fatal);
+  }
+  // stop pulling (cancelled): tell the owner at once, on ctl, so it stops before its next chunk
+  function cancelPull(x) {
+    const a = x.att;
+    x.att = null;
+    if (a && a.c.pulls.get(a.xid) === a) { a.c.pulls.delete(a.xid); a.c.send({ t: 'close', xid: a.xid }); }
+  }
+
+  // where downloaded bytes go: memory for now (blob parts, folded into a blob
+  // every 16 MB so the browser can page them out)
+  function memSink() {
+    const t = { parts: [], mem: 0 };
+    return {
+      write: u8 => collect(t, u8),
+      whole: b => { t.parts = [b]; },
+      blob: () => new Blob(t.parts),
+    };
   }
 
   // ---- zip (store only) for folder downloads ------------------------------
@@ -615,7 +913,18 @@
   }
 
   // ---- the panel: notes + files, shared by host and guest -----------------
-  // src: { files, notes, writable(), get(path, prog, signal), put(blob, path, mtime, prog, hash, signal), rm(path, dir), note(title, text, id), unnote(id) }
+  // src: { items, notes, members, me(), writable(), verb, offline(item), hint(),
+  //        add(list, sig, say), fetch(item, sink, prog, sig, waiting), rm(ids), rmDir(path),
+  //        note(title, text, id), unnote(id) }
+
+  // quick fingerprint for "is this the same file": sha-256 of the size, the first
+  // and the last MiB. reads at most 2 MiB however big the file is
+  async function fingerprint(f, sig) {
+    const head = new Uint8Array(8), v = new DataView(head.buffer), M = 1 << 20;
+    v.setUint32(0, Math.floor(f.size / 2 ** 32));
+    v.setUint32(4, f.size >>> 0);
+    return sha256(new Blob(f.size <= 2 * M ? [head, f] : [head, f.slice(0, M), f.slice(f.size - M)]), null, sig);
+  }
 
   let dropTo = null, pasteTo = null;
   function panel(src, say, statusEl) {
@@ -623,6 +932,7 @@
     const open = new Set();
     const notesEl = el('ul', { class: 'ls' });
     const filesEl = el('ul', { class: 'ls' });
+    const hintEl = el('p', { class: 'mute', hidden: true });
     const crumbs = el('div', { class: 'row grow' });
     const title = el('input', { class: 'grow', placeholder: 'title', maxlength: String(TITLE_MAX), 'aria-label': 'note title' });
     const text = el('textarea', { placeholder: 'paste or type anything…', 'aria-label': 'note text', maxlength: String(NOTE_MAX) });
@@ -643,7 +953,7 @@
     } }, el('div', { class: 'row' }, title), text, el('div', { class: 'row' }, el('button', { type: 'submit' }, 'save'), el('button', { type: 'button', class: 'link', onclick: closeNote }, 'cancel')));
     const addNote = el('button', { onclick: () => openNote(null) }, '+ note');
     const fileIn = el('input', { type: 'file', multiple: true, onchange: () => { upload([...fileIn.files].map(f => [f, f.name])); fileIn.value = ''; } });
-    const dirIn = el('input', { type: 'file', webkitdirectory: true, onchange: () => { upload([...dirIn.files].map(f => [f, f.webkitRelativePath || f.name])); dirIn.value = ''; } });
+    const dirIn = el('input', { type: 'file', webkitdirectory: true, onchange: () => { upload([...dirIn.files].map(f => [f, f.webkitRelativePath || f.name]), true); dirIn.value = ''; } });
     // labels don't open their file picker from the keyboard on their own
     const pick = (label, input) => el('label', { class: 'btn', tabindex: '0', onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } } }, label, input);
     const tools = el('span', { class: 'row' }, pick('+ files', fileIn), pick('+ folder', dirIn));
@@ -651,6 +961,7 @@
     const cwd = () => { try { return clean(decodeURIComponent(location.hash.slice(1))) || ''; } catch { return ''; } };
     const cd = p => { location.hash = p ? encodeURIComponent(p).replace(/%2F/g, '/') : ''; };
     const fail = e => status('error: ' + (e && e.message || e));
+    const byPath = () => { const m = new Map(); for (const it of src.items.values()) m.set(it.path, it); return m; };
 
     // transfers in progress, each with an AbortController: "cancel" stops them all
     const running = new Set(), title0 = document.title, me = {};
@@ -691,112 +1002,93 @@
       };
     }
 
-    // upload batches run one after another, each into the folder that was open when it was added
+    // batches run one after another, each into the folder that was open when it was added
     let queue = Promise.resolve();
-    function upload(items) {
+    function upload(items, dir) {
       if (!src.writable() || !items.length) return;
       const base = cwd() ? cwd() + '/' : '', ctl = track();
-      queue = queue.then(() => send(items, base, ctl)).finally(() => untrack(ctl));
+      queue = queue.then(() => send(items, base, ctl, dir)).finally(() => untrack(ctl));
     }
     // yes/no bubble on the status line (the cancel button lives there, even while hidden)
     const sure = q => new Promise(r => ask(cancelBtn, q, () => r(true), () => r(false)));
     const short = s => `"${s.length > 40 ? s.slice(0, 18) + '…' + s.slice(-18) : s}"`;
-    async function send(items, base, ctl) {
-      const sig = ctl.signal, inflight = new Set();
-      let done = 0, skipped = 0;
+    async function send(list, base, ctl, dir) {
+      const sig = ctl.signal, verb = src.verb;
+      let items = list.map(([f, rel]) => ({ f, rel, path: clean(base + rel) })).filter(it => it.path);
+      let skipped = 0;
       try {
         if (sig.aborted) throw sig.reason;
-        // same name as a file already in this folder? ask first; if allowed, those
-        // are uploaded without the content check below
-        const named = new Set(items.filter(([, rel]) => src.files.has(clean(base + rel))));
+        // same name as something already in this folder? ask first; if allowed, those
+        // skip the content check below
+        const paths = byPath(), named = new Set(items.filter(it => paths.has(it.path)));
         if (named.size) {
-          if (sig.aborted) throw sig.reason;
-          const [[, rel]] = named;
+          const [{ rel }] = named;
           status('');
-          const ok = await sure(named.size > 1 ? `${named.size} files with these names already exist. upload them anyway?`
-            : `${short(rel)} already exists. upload anyway?`);
+          const ok = await sure(named.size > 1 ? `${named.size} files with these names already exist. ${verb} them anyway?`
+            : `${short(rel)} already exists. ${verb} anyway?`);
           if (sig.aborted) throw sig.reason;
           if (!ok) { skipped = named.size; items = items.filter(it => !named.has(it)); named.clear(); }
         }
-        // same content as a file already here, or earlier in this batch? only files
-        // whose size matches another one get hashed, so most uploads skip this
-        const have = new Map(), sizes = new Map(), dups = new Map();
-        for (const f of src.files.values()) if (f.hash) { have.set(f.hash, [f.path, false]); sizes.set(f.size, 1); }
-        for (const it of items) if (!named.has(it)) sizes.set(it[0].size, (sizes.get(it[0].size) || 0) + 1);
+        // same content as something already here, or earlier in this batch? (size + fingerprint)
+        const have = new Map(), dups = new Map();
+        for (const it of src.items.values()) if (it.fp) have.set(it.size + ':' + it.fp, [it.path, false]);
+        let k = 0;
         for (const it of items) {
-          const [f, rel] = it;
-          if (named.has(it) || sizes.get(f.size) < 2) continue;
-          it.hash = await sha256(f, b => !sig.aborted && status(`checking ${rel} ${pct(b, f.size)}`), sig);
+          k++;
+          if (items.length > 20 || it.f.size > 64 << 20) status(`checking ${items.length > 1 ? `${k}/${items.length}` : it.rel}…`);
+          it.fp = await fingerprint(it.f, sig);
           if (sig.aborted) throw sig.reason;
-          if (have.has(it.hash)) dups.set(it, have.get(it.hash));
-          else have.set(it.hash, [clean(base + rel), true]);
+          if (named.has(it)) continue;
+          const key = it.f.size + ':' + it.fp;
+          if (have.has(key)) dups.set(it, have.get(key));
+          else have.set(key, [it.path, true]);
         }
         if (sig.aborted) throw sig.reason; // never ask after a cancel
         if (dups.size) {
-          const [[[, rel], [at, batch]]] = dups, same = at === clean(base + rel);
+          const [[{ rel, path }, [at, batch]]] = dups, same = at === path;
           status('');
-          const ok = await sure(dups.size > 1 ? `${dups.size} of these files already exist. upload them anyway?`
-            : batch ? `${short(rel)} is the same file as ${short(at)}. upload both?`
-            : `${short(rel)} already exists${same ? '' : ' as ' + short(at)}. upload anyway?`);
+          const ok = await sure(dups.size > 1 ? `${dups.size} of these files are already here. ${verb} them anyway?`
+            : batch ? `${short(rel)} is the same file as ${short(at)}. ${verb} both?`
+            : `${short(rel)} is already here${same ? '' : ' as ' + short(at)}. ${verb} anyway?`);
           if (sig.aborted) throw sig.reason;
           if (!ok) { skipped += dups.size; items = items.filter(it => !dups.has(it)); }
         }
         if (sig.aborted) throw sig.reason;
-        items = items.filter(([, rel]) => clean(base + rel));
-        const total = items.reduce((s, [f]) => s + f.size, 0);
-        let sent = 0, saving = 0;
-        const show = meter(total, () => items.length === 1 ? `↑ ${items[0][1]}` : `↑ ${done}/${items.length}`);
-        // a few at once, so small files don't each wait out a round trip
-        await pool(items, 3, async it => {
-          const [f, rel] = it;
-          let last = 0, mine = false;
-          // all bytes out and the host is storing them: say so instead of a frozen 100%
-          const step = (b, stored) => {
-            if (stored && !mine) { mine = true; saving++; }
-            sent += b - last;
-            last = b;
-            if (sig.aborted) return;
-            if (saving && saving === items.length - done) status('saving on host…');
-            else show(sent);
-          };
-          const put = src.put(f, clean(base + rel), f.lastModified, step, it.hash, sig);
-          inflight.add(put);
-          try { await put; } finally { if (mine) saving--; }
-          done++;
-          step(f.size);
-        }, sig);
-        status(!done && skipped ? 'not uploaded — already here' : `↑ ${done} file${done === 1 ? '' : 's'} added${skipped ? ` · ${skipped} duplicate${skipped === 1 ? '' : 's'} skipped` : ''}`);
+        const r = items.length ? await src.add(items, sig, status, dir && clean(base + list[0][1].split('/')[0])) : { done: 0 };
+        const n = r.done;
+        status(!n && skipped ? 'nothing added — already here' : `${src.verb === 'share' ? '' : '↑ '}${n} file${n === 1 ? '' : 's'} ${src.verb === 'share' ? 'shared' : 'added'}${skipped ? ` · ${skipped} duplicate${skipped === 1 ? '' : 's'} skipped` : ''}${r.note ? ' · ' + r.note : ''}`);
       } catch (e) {
         const stopped = sig.aborted;
-        ctl.abort(); // a failed file stops the rest of its batch
-        if (!stopped) return fail(e);
-        // a file the host was already storing may still report back: either way, say which
-        const late = (await Promise.allSettled(inflight)).filter(r => r.status === 'rejected' && r.reason && r.reason.saved).length;
-        done += late;
-        status(late && late === done ? `↑ already saved${done > 1 ? ` · ${done} files` : ''}` : `↑ cancelled${done ? ` · ${done} file${done === 1 ? '' : 's'} added` : ''}`);
+        ctl.abort();
+        stopped ? status(`${src.verb === 'share' ? '' : '↑ '}cancelled${e && e.done ? ` · ${e.done} file${e.done === 1 ? '' : 's'} added` : ''}`) : fail(e);
       }
     }
+    // a waiting download says why
+    const waiting = name => status(name ? `waiting for ${name}…` : '');
     async function get(path, isDir) {
       const name = path.split('/').pop(), ctl = track(), sig = ctl.signal;
       try {
         if (!isDir) {
-          const f = src.files.get(path);
-          const blob = await src.get(path, meter(f ? f.size : 0, () => `↓ ${name}`), sig);
+          const it = byPath().get(path);
+          if (!it) throw new Error('not here any more');
+          const sink = memSink();
+          await src.fetch(it, sink, meter(it.size, () => `↓ ${name}`), sig, waiting);
           if (sig.aborted) throw sig.reason;
-          save(blob, name);
+          save(sink.blob(), name);
           return status(`↓ ${name} done`);
         }
-        const list = [...src.files.values()].filter(f => f.path.startsWith(path + '/'));
+        const list = [...src.items.values()].filter(f => f.path.startsWith(path + '/'));
         const total = list.reduce((s, f) => s + f.size, 0), entries = [];
         let got = 0, done = 0;
         const show = meter(total, () => `↓ ${name}/ ${done}/${list.length}`);
         await pool(list, 4, async (f, k) => {
           let last = 0;
           const step = b => { got += b - last; last = b; show(got); };
-          const blob = await src.get(f.path, step, sig);
+          const sink = memSink();
+          await src.fetch(f, sink, step, sig, waiting);
           done++;
           step(f.size);
-          entries[k] = { name: f.path.slice(path.length - name.length), blob, mtime: f.mtime };
+          entries[k] = { name: f.path.slice(path.length - name.length), blob: sink.blob(), mtime: f.mtime };
         }, sig);
         status(`zipping ${name}…`);
         save(await zip(entries), name + '.zip');
@@ -817,13 +1109,16 @@
       const ids = [...owners.keys()].sort((a, b) => owners.get(b) - owners.get(a));
       return who(ids[0]) + (ids.length > 1 ? ` +${ids.length - 1}` : '');
     };
-    function row(label, meta, acts) {
-      return el('li', {}, label, el('span', { class: 'mute meta' }, meta), el('span', { class: 'acts' }, acts));
+    function row(label, meta, acts, off) {
+      return el('li', { class: off ? 'off' : null }, label, el('span', { class: 'mute meta' }, meta), el('span', { class: 'acts' }, acts));
     }
     function refresh() {
       const w = src.writable();
       addNote.hidden = tools.hidden = !w;
       if (!w || (editing && !src.notes.has(editing))) closeNote();
+      const hint = src.hint && src.hint();
+      hintEl.hidden = !hint;
+      hintEl.textContent = hint || '';
 
       const notes = [...src.notes.values()].sort((a, b) => b.t - a.t);
       notesEl.replaceChildren(...notes.map(n => {
@@ -839,13 +1134,14 @@
 
       const dir = cwd(), pre = dir ? dir + '/' : '';
       const dirs = new Map(), files = [];
-      for (const f of src.files.values()) {
+      for (const f of src.items.values()) {
         if (!f.path.startsWith(pre)) continue;
         const rest = f.path.slice(pre.length), i = rest.indexOf('/');
         if (i < 0) { files.push(f); continue; }
-        const d = dirs.get(rest.slice(0, i)) || { n: 0, size: 0, owners: new Map() };
+        const d = dirs.get(rest.slice(0, i)) || { n: 0, size: 0, owners: new Map(), off: 0 };
         d.n++;
         d.size += f.size;
+        if (src.offline(f)) d.off++;
         d.owners.set(f.owner, (d.owners.get(f.owner) || 0) + 1);
         dirs.set(rest.slice(0, i), d);
       }
@@ -854,15 +1150,18 @@
         ...segs.flatMap((s, i) => [' ', el('button', { class: 'link', onclick: () => cd(segs.slice(0, i + 1).join('/')) }, s), ' /']));
       const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true });
       filesEl.replaceChildren(
-        ...[...dirs.keys()].sort(byName).map(d => row(
-          el('button', { class: 'link', onclick: () => cd(pre + d) }, d + '/'),
-          `${dirs.get(d).n} · ${size(dirs.get(d).size)} · ${whos(dirs.get(d).owners)}`,
-          [el('button', { onclick: () => get(pre + d, true) }, 'get'), w && el('button', { onclick: e => ask(e.target, `delete ${d}/ and all inside?`, () => src.rm(pre + d, true)) }, 'del')],
-        )),
+        ...[...dirs.keys()].sort(byName).map(d => {
+          const x = dirs.get(d), gone = x.off === x.n;
+          return row(
+            el('button', { class: 'link', onclick: () => cd(pre + d) }, d + '/'),
+            `${x.n} · ${size(x.size)} · ${whos(x.owners)}${gone ? ' · offline' : ''}`,
+            [el('button', { disabled: gone, onclick: () => get(pre + d, true) }, 'get'), w && el('button', { onclick: e => ask(e.target, `delete ${d}/ and all inside?`, () => src.rmDir(pre + d)) }, 'del')],
+            gone);
+        }),
         ...files.sort((a, b) => byName(a.path, b.path)).map(f => {
-          const name = f.path.slice(pre.length);
-          return row(el('span', {}, name), `${size(f.size)} · ${who(f.owner)}`,
-            [el('button', { onclick: () => get(f.path) }, 'get'), w && el('button', { onclick: e => ask(e.target, 'delete this file?', () => src.rm(f.path)) }, 'del')]);
+          const name = f.path.slice(pre.length), off = src.offline(f);
+          return row(el('span', {}, name), `${size(f.size)} · ${who(f.owner)}${off ? ' · offline' : ''}`,
+            [el('button', { disabled: !!off, onclick: () => get(f.path) }, 'get'), w && el('button', { onclick: e => ask(e.target, f.owner === src.me() ? 'stop sharing this file?' : 'delete this file?', () => src.rm([f.id])) }, 'del')], off);
         }),
       );
       if (!dirs.size && !files.length) filesEl.append(el('li', { class: 'empty' }, !w ? 'empty' : coarse() ? 'empty — tap + files to add some' : 'empty — drop files or folders, or paste an image, anywhere on the page'));
@@ -876,7 +1175,8 @@
         if (entries.length) for (const en of entries) await walk(en, '', items);
         else for (const f of e.dataTransfer.files) items.push([f, f.name]);
       } catch (err) { return fail(err); }
-      upload(items);
+      // one dropped folder: a clash renames the folder ("photos (bob)/") rather than each file
+      upload(items, entries.length === 1 && entries[0].isDirectory);
     };
 
     // pasted screenshots are all called "image.png": give them a unique name
@@ -885,12 +1185,12 @@
       const d = new Date(), z = n => String(n).padStart(2, '0');
       const t = `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}.${z(d.getMinutes())}.${z(d.getSeconds())}`;
       // two pastes in the same second would overwrite each other: number the later ones
-      const base = cwd() ? cwd() + '/' : '', used = new Set();
+      const base = cwd() ? cwd() + '/' : '', used = new Set(), paths = byPath();
       upload(list.map(f => {
         if (f.name && !/^image\.\w+$/i.test(f.name)) return [f, f.name];
         const ext = (f.type.split('/')[1] || 'png').replace(/\W.*/, '');
         let name = `pasted ${t}.${ext}`;
-        for (let n = 2; used.has(name) || src.files.has(clean(base + name)); n++) name = `pasted ${t} (${n}).${ext}`;
+        for (let n = 2; used.has(name) || paths.has(clean(base + name)); n++) name = `pasted ${t} (${n}).${ext}`;
         used.add(name);
         return [f, name];
       }));
@@ -898,7 +1198,7 @@
 
     const el_ = [
       el('section', { class: 'panel' }, el('div', { class: 'row' }, el('h2', { class: 'grow' }, 'notes'), addNote), noteForm, notesEl),
-      el('section', { class: 'panel' }, el('div', { class: 'row' }, el('h2', {}, 'files'), crumbs, tools), filesEl),
+      el('section', { class: 'panel' }, el('div', { class: 'row' }, el('h2', {}, 'files'), crumbs, tools), filesEl, hintEl),
     ];
     const out = { els: el_, refresh, foot };
     refresh();
@@ -1040,28 +1340,79 @@
     if (!coarse()) name.focus(); // on phones that would pop the keyboard over the page
   }
 
+  // ---- downloads, shared by host and guest ----------------------------------
+  // one download, across reconnects and routes. route(x) starts an attempt and
+  // returns true, or returns { wait: name } (the owner is away: parked until kick())
+  // or { fail: message }
+  function download(it, sink, prog, sig, waiting, route, xfers) {
+    return new Promise((res, rej) => {
+      if (sig.aborted) return rej(sig.reason);
+      const x = { id: it.id, got: 0, size: null, mtime: null, sink, prog, att: null, parked: false, waitFor: '' };
+      x.finish = err => {
+        if (!xfers.delete(x)) return;
+        clearTimeout(x.retry);
+        cancelPull(x);
+        err ? rej(err) : res();
+      };
+      x.failed = (err, fatal) => {
+        if (fatal || (err && err !== 'offline')) return x.finish(new Error(err || 'failed'));
+        clearTimeout(x.retry);
+        x.retry = setTimeout(x.go, err ? 1000 : 300); // connection went, or the owner just did: look again shortly
+      };
+      x.go = async () => {
+        if (!xfers.has(x) || x.att) return;
+        x.parked = false;
+        let r;
+        try { r = await route(x); } catch (e) { r = { fail: e.message }; }
+        if (!xfers.has(x) || r === true) return;
+        if (r.fail) return x.finish(new Error(x.waitFor && r.gone ? `${x.waitFor} went offline` : r.fail));
+        x.parked = true;
+        if (r.wait && r.wait !== x.waitFor) waiting(r.wait);
+        x.waitFor = r.wait || x.waitFor;
+      };
+      sig.addEventListener('abort', () => x.finish(sig.reason), { once: true });
+      xfers.add(x);
+      x.go();
+    });
+  }
+  // something changed (an owner came back, a connection opened): parked downloads look again
+  const kick = xfers => { for (const x of xfers) if (x.parked) x.go(); };
+
   // ---- host ---------------------------------------------------------------
 
   async function host(sess) {
     document.title = sess.slug + ' · p2p';
     if (location.pathname !== '/' + sess.slug) history.replaceState(null, '', '/' + sess.slug);
     current = location.pathname;
-    const files = new Map(), notes = new Map(), peers = new Map(), db = idb(sess.slug);
+    // items: everything listed. stored ones (the host's own) are in indexeddb by id;
+    // ref ones are in a guest's open tab: via says which tab (peer id). paths: path → id
+    const items = new Map(), paths = new Map(), via = new Map(), notes = new Map(), peers = new Map(), db = idb(sess.slug);
     // the member registry: { id, secretHash, name, key, lastSeen }. this browser decides
     // who is who in its share; secrets and their hashes never leave it
     const members = new Map();
     const { id: myId, secretHash: mySecret } = await memberOf(await shareSecret(sess.slug));
+    // recently deleted ids, so a guest coming back doesn't publish them again
+    const TOMB = 'p2p:tomb:' + sess.slug, tomb = new Set(arr(store.get(TOMB)).filter(id => ITEM.test(id)));
+    const unfp = [];
     try {
       for (const m of await db.all('members')) {
         const name = normName(m.name);
         if (name && MEMBER.test(m.id) && typeof m.secretHash === 'string') members.set(m.id, { id: m.id, secretHash: m.secretHash, name, key: nameKey(name), lastSeen: +m.lastSeen || 0 });
       }
-      for (const f of await db.all('files')) files.set(f.path, { path: f.path, size: f.size, mtime: f.mtime, hash: HASH.test(f.hash) ? f.hash : null, owner: MEMBER.test(f.owner) ? f.owner : myId });
+      for (const r of await db.all('items')) {
+        const path = clean(r.path);
+        if (!path || !ITEM.test(r.id) || !r.blob) continue;
+        const it = { id: r.id, path, size: r.blob.size, mtime: +r.mtime || 0, fp: HASH.test(r.fp) ? r.fp : null, owner: myId, kind: 'stored', off: 0 };
+        items.set(it.id, it);
+        paths.set(path, it.id);
+        if (!it.fp) unfp.push([it, r.blob]);
+      }
       for (const n of await db.all('notes')) notes.set(n.id, { id: n.id, title: n.title, text: n.text, t: n.t, author: MEMBER.test(n.author) ? n.author : myId, editor: MEMBER.test(n.editor) ? n.editor : null });
     } catch {}
     const online = id => id === myId || [...peers.values()].some(p => p.member === id);
-    // a name is held while its member is online or was seen in the last 30 days
-    const taken = (key, except) => [...members.values()].some(m => m.id !== except && m.key === key && (online(m.id) || Date.now() - m.lastSeen < RESERVE));
+    const holds = id => [...items.values()].some(it => it.owner === id);
+    // a name is held while its member is online, has things here, or was seen in the last 30 days
+    const taken = (key, except) => [...members.values()].some(m => m.id !== except && m.key === key && (online(m.id) || holds(m.id) || Date.now() - m.lastSeen < RESERVE));
     // "alice" -> the first free of "alice-2", "alice-3", …
     const suggest = name => {
       for (let n = 2; ; n++) {
@@ -1072,7 +1423,7 @@
     const keepMember = m => db.put('members', m).catch(() => {});
     // members that are long gone and own nothing here: their names are free again
     for (const m of [...members.values()]) {
-      const owns = [...files.values()].some(f => f.owner === m.id) || [...notes.values()].some(n => n.author === m.id || n.editor === m.id);
+      const owns = holds(m.id) || [...notes.values()].some(n => n.author === m.id || n.editor === m.id);
       if (m.id !== myId && !owns && Date.now() - m.lastSeen > RESERVE) { members.delete(m.id); db.del('members', m.id).catch(() => {}); }
     }
     // the host is a member too. renaming yourself to a name a guest holds is refused
@@ -1091,98 +1442,198 @@
     const kp = await keypair().catch(() => null);
     if (location.pathname !== '/' + sess.slug) return; // navigated away while loading
     const unhold = hold();
-
     const persist = () => setHost(sess);
-    // v 2: gets take an offset and puts can resume, so guests pick up after a reconnect
-    // what guests may know about members: names and whether they are here. only people
-    // who are online or have something in the share
-    const pub = () => {
+    const nameOf = id => (members.get(id) || {}).name || 'someone';
+
+    // ---- what guests see, and changes to it
+    // guests learn members' names and whether they're here; only people who are
+    // online or have something in the share
+    const pubMember = m => ({ id: m.id, name: m.name, online: online(m.id), offlineSince: online(m.id) ? 0 : m.lastSeen });
+    const pubMembers = () => {
       const used = new Set([myId]);
-      for (const f of files.values()) used.add(f.owner);
+      for (const it of items.values()) used.add(it.owner);
       for (const n of notes.values()) { used.add(n.author); used.add(n.editor); }
-      return [...members.values()].filter(m => used.has(m.id) || online(m.id)).map(m => ({ id: m.id, name: m.name, online: online(m.id), offlineSince: online(m.id) ? 0 : m.lastSeen }));
+      return [...members.values()].filter(m => used.has(m.id) || online(m.id)).map(pubMember);
     };
-    const ls = () => ({ t: 'ls', v: 3, mode: sess.mode, files: [...files.values()], notes: [...notes.values()], members: pub() });
-    let lsTimer;
-    const changed = () => {
-      clearTimeout(lsTimer);
-      lsTimer = setTimeout(() => { const m = ls(); for (const p of peers.values()) if (p.member) tx(p.dc, m); }, 80);
+    const pubItem = it => ({ id: it.id, path: it.path, size: it.size, mtime: it.mtime, fp: it.fp, owner: it.owner, kind: it.kind, off: it.off || 0 });
+    let rev = 0, flushT = null;
+    const D = { add: new Map(), up: new Map(), rm: new Set(), nup: new Map(), nrm: new Set(), mem: new Set(), mode: false };
+    const snap = t => ({ t, v: 3, rev, mode: sess.mode, members: pubMembers(), items: [...items.values()].map(pubItem), notes: [...notes.values()], tomb: [...tomb] });
+    // changes go out together, numbered, a moment after they happen
+    function flush() {
+      if (!D.add.size && !D.up.size && !D.rm.size && !D.nup.size && !D.nrm.size && !D.mem.size && !D.mode) return;
+      rev++;
+      const m = {
+        t: 'delta', rev,
+        items: { add: [...D.add.values()].map(pubItem), up: [...D.up.values()].map(pubItem), rm: [...D.rm] },
+        notes: { up: [...D.nup.values()], rm: [...D.nrm] },
+        members: { up: [...D.mem].map(id => members.get(id)).filter(Boolean).map(pubMember), rm: [] },
+      };
+      if (D.mode) m.mode = sess.mode;
+      D.add.clear(); D.up.clear(); D.rm.clear(); D.nup.clear(); D.nrm.clear(); D.mem.clear(); D.mode = false;
+      for (const p of peers.values()) if (p.member) p.c.send(m);
+    }
+    let shown = false;
+    function dirty() {
+      clearTimeout(flushT);
+      flushT = setTimeout(flush, 80);
+      if (!shown) return;
       v.refresh();
       showPeople();
+      kick(xfers);
+    }
+    const putItem = it => { items.set(it.id, it); paths.set(it.path, it.id); D.rm.delete(it.id); D.add.set(it.id, it); dirty(); };
+    const upItem = it => { if (!D.add.has(it.id)) D.up.set(it.id, it); dirty(); };
+    const dropItem = id => {
+      const it = items.get(id);
+      if (!it) return;
+      items.delete(id);
+      via.delete(id);
+      if (paths.get(it.path) === id) paths.delete(it.path);
+      D.add.delete(id); D.up.delete(id); D.rm.add(id);
+      dirty();
     };
-    const src = {
-      files, notes, members,
-      me: () => myId,
-      writable: () => true,
-      get: async path => (await db.get('files', path)).blob,
-      // hash: when the uploader already worked it out here; guest uploads get hashed by fill()
-      put: async (blob, path, mtime, prog, hash, signal, owner = myId) => {
-        const f = { path, size: blob.size, mtime: Number.isSafeInteger(mtime) ? mtime : Date.now(), hash: HASH.test(hash) ? hash : null, owner };
-        await db.put('files', { ...f, blob }, signal);
-        // cancelled just as the write committed: take it back out, if nothing replaced it since
-        if (signal && signal.aborted) {
-          await db.delIf('files', path, r => r.size === f.size && r.mtime === f.mtime && (r.hash || null) === f.hash).catch(() => {});
-          throw signal.reason;
-        }
-        files.set(path, f);
-        changed();
-        if (!f.hash) fill();
-      },
-      rm: async (path, dir) => {
-        if (dir) {
-          await db.delPrefix('files', path + '/');
-          for (const k of files.keys()) if (k.startsWith(path + '/')) files.delete(k);
-        } else {
-          await db.del('files', path);
-          files.delete(path);
-        }
-        changed();
-      },
-      // new note, or an edit when id names an existing one. the author stays;
-      // someone else's edit shows as "edited by"
-      note: async (title, text, id, by = myId) => {
-        const old = notes.get(id), n = mkNote(title, text, old ? id : null);
-        if (!n || (!old && notes.size >= NOTES_MAX)) return;
-        n.author = old ? old.author : by;
-        n.editor = n.author === by ? null : by;
-        await db.put('notes', n);
-        notes.set(n.id, n);
-        changed();
-      },
-      unnote: async id => {
-        await db.del('notes', id);
-        notes.delete(id);
-        changed();
-      },
+    const memberChanged = id => { D.mem.add(id); dirty(); };
+    const putNote = n => { notes.set(n.id, n); D.nrm.delete(n.id); D.nup.set(n.id, n); dirty(); };
+    const dropNote = id => { notes.delete(id); D.nup.delete(id); D.nrm.add(id); dirty(); db.del('notes', id).catch(() => {}); };
+    const bury = id => {
+      tomb.delete(id);
+      tomb.add(id);
+      for (const k of tomb) { if (tomb.size <= TOMB_MAX) break; tomb.delete(k); }
+      store.set(TOMB, [...tomb]);
     };
+    const peersOf = id => [...peers.values()].filter(p => p.member === id);
 
-    // every file gets a sha-256 so uploads of the same content can be flagged.
-    // done in the background for guest uploads and files stored before hashes existed,
-    // and held off while guests are transferring: hashing a big file in js would halve their speed
-    let filling = false, again = false, serving = 0;
-    const hot = () => serving > 0 || [...peers.values()].some(p => p.ups.size > 0);
-    const cool = async () => { while (hot()) await new Promise(r => setTimeout(r, 1000)); };
-    async function fill() {
-      if (filling) return void (again = true);
-      filling = true;
-      do {
-        again = false;
-        for (const f of [...files.values()].filter(f => !f.hash)) {
-          try {
-            await cool();
-            const rec = await db.get('files', f.path);
-            if (!rec || files.get(f.path) !== f) continue;
-            const hash = await sha256(rec.blob, cool);
-            if (files.get(f.path) !== f) continue; // replaced or deleted meanwhile
-            await db.patch('files', f.path, r => !r.hash && r.size === f.size && r.mtime === f.mtime && { ...r, hash });
-            f.hash = hash;
-          } catch {}
+    // where added files go: their own path, unless someone else has something there:
+    // then "report (bob).pdf", or for a folder added whole, "photos (bob)/…"
+    function place(list, owner, dir) {
+      const name = nameOf(owner), seen = new Map(paths);
+      const clash = p => { const id = seen.get(p), o = id && items.get(id); return id && (!o || o.owner !== owner); };
+      const free = p => !seen.has(p) && ![...seen.keys()].some(k => k.startsWith(p + '/'));
+      let from = null, to = null;
+      if (dir && list.some(it => it.path.startsWith(dir + '/') && clash(it.path))) {
+        for (let n = 1; ; n++) { to = `${dir} (${name}${n > 1 ? ' ' + n : ''})`; if (free(to)) break; }
+        from = dir;
+      }
+      return list.map(it => {
+        let p = from && it.path.startsWith(from + '/') ? to + it.path.slice(from.length) : it.path;
+        if (clash(p)) {
+          const i = p.lastIndexOf('/'), d = p.slice(0, i + 1), b = p.slice(i + 1), dot = b.lastIndexOf('.');
+          const stem = dot > 0 ? b.slice(0, dot) : b, ext = dot > 0 ? b.slice(dot) : '';
+          for (let n = 1; ; n++) { const c = `${d}${stem} (${name}${n > 1 ? ' ' + n : ''})${ext}`; if (!seen.has(c)) { p = c; break; } }
         }
-      } while (again);
-      filling = false;
-      changed();
+        p = clean(p);
+        if (p) seen.set(p, '-' + owner); // later ones in the batch see it (not an item: always a clash for others)
+        return p;
+      });
     }
 
+    // take items out of the share. stored: deleted from this browser. ref: the owner's
+    // file stays on their disk; they're told. why: deleted (remembered, so it isn't
+    // published again), one-way, replaced, gone (owner away too long / tab closed), pin
+    function remove(list, by, why = 'deleted') {
+      const owners = new Map();
+      for (const it of list) {
+        if (!it || !items.has(it.id)) continue;
+        dropItem(it.id);
+        if (it.kind === 'stored') db.del('items', it.id).catch(() => {});
+        else if (why === 'deleted' || why === 'one-way') { const o = owners.get(it.owner) || []; o.push(it.id); owners.set(it.owner, o); }
+        if (why === 'deleted' || why === 'one-way') bury(it.id);
+        stopFor(it.id, why === 'one-way' ? 'the host switched to one-way' : 'removed from the share');
+      }
+      for (const [owner, ids] of owners) for (const p of peersOf(owner)) p.c.send({ t: 'unshared', ids, by, why });
+      showStorage();
+    }
+    // transfers of something that's gone: what the host forwards, and its own downloads
+    function stopFor(id, why) {
+      for (const p of peers.values()) if (p.c) for (const s of [...p.c.serves.values()]) if (s.id === id) endServe(s, why);
+      for (const x of [...xfers]) if (x.id === id) x.finish(new Error(why));
+    }
+
+    // ---- the host's own files: copied into this browser's storage
+    async function addStored(list, sig, say, dir) {
+      const total = list.reduce((s, it) => s + it.f.size, 0);
+      const q = navigator.storage && navigator.storage.estimate && await navigator.storage.estimate().catch(() => null);
+      if (q && q.quota - q.usage < total * 1.05) throw new Error(`not enough browser storage: ${size(total)} needed, ${size(Math.max(0, q.quota - q.usage))} free`);
+      const where = place(list, myId, dir);
+      let done = 0;
+      try {
+        for (const [k, it] of list.entries()) {
+          if (sig.aborted) throw sig.reason;
+          const path = where[k];
+          if (!path) continue;
+          say(list.length > 1 ? `↑ copying ${done + 1}/${list.length}…` : `↑ copying ${it.rel}…`);
+          const rec = { id: newId(), path, size: it.f.size, mtime: Number.isSafeInteger(it.f.lastModified) ? it.f.lastModified : Date.now(), fp: it.fp, owner: myId, kind: 'stored', off: 0 };
+          await db.put('items', { slug: sess.slug, id: rec.id, path, mtime: rec.mtime, fp: rec.fp, blob: it.f }, sig);
+          if (sig.aborted) { await db.del('items', rec.id).catch(() => {}); throw sig.reason; }
+          // the same name of yours: the new one replaces it
+          const old = items.get(paths.get(path));
+          if (old && old.owner === myId) remove([old], myId, 'replaced');
+          putItem(rec);
+          done++;
+        }
+      } catch (e) {
+        throw Object.assign(e instanceof Error ? e : new Error(String(e)), { done });
+      } finally { showStorage(); }
+      return { done };
+    }
+    // fingerprints for files stored before they existed (cheap: 2 MiB each)
+    (async () => {
+      for (const [it, blob] of unfp.splice(0)) {
+        try {
+          const fp = await fingerprint(blob);
+          if (items.get(it.id) !== it) continue;
+          it.fp = fp;
+          await db.patch('items', it.id, r => ({ ...r, fp }));
+          upItem(it);
+        } catch {}
+      }
+    })();
+
+    // ---- notes: anyone may edit or delete; the author stays, "edited by" shows who changed it
+    function doNote(title, text, id, by) {
+      const old = notes.get(id), n = mkNote(title, text, old ? id : null);
+      if (!n) return;
+      if (!old && (notes.size >= NOTES_MAX || (by !== myId && [...notes.values()].filter(x => x.author === by).length >= NOTES_PER))) return 'too many notes';
+      n.author = old ? old.author : by;
+      n.editor = n.author === by ? null : by;
+      db.put('notes', n).catch(() => {});
+      putNote(n);
+    }
+
+    // ---- downloads the host makes (from guests' tabs; its own are right here)
+    const xfers = new Set();
+    function route(x) {
+      const it = items.get(x.id);
+      if (!it) return { fail: 'not available any more', gone: true };
+      const p = peers.get(via.get(it.id));
+      if (it.off || !p || !p.c || !p.member) return { wait: nameOf(it.owner) };
+      attempt(p.c, x);
+      return true;
+    }
+
+    const src = {
+      items, notes, members, verb: 'upload',
+      me: () => myId,
+      writable: () => true,
+      offline: it => it.off || 0,
+      hint: () => null,
+      add: addStored,
+      fetch: async (it, sink, prog, sig, waiting) => {
+        if (it.kind === 'stored') {
+          const r = await db.get('items', it.id);
+          if (!r || !r.blob) throw new Error('not here any more');
+          return sink.whole(r.blob);
+        }
+        return download(it, sink, prog, sig, waiting, route, xfers);
+      },
+      rm: ids => remove(ids.map(id => items.get(id)), myId),
+      rmDir: path => remove([...items.values()].filter(it => it.path.startsWith(path + '/')), myId),
+      note: (title, text, id) => doNote(title, text, id, myId),
+      unnote: id => notes.has(id) && dropNote(id),
+    };
+
+    // ---- the page
     const state = el('span', { class: 'mute' }, 'connecting…');
     const status = el('p', { class: 'status' });
     const say = t => { status.textContent = t; };
@@ -1202,11 +1653,25 @@
       qrBtn.textContent = qrBox.hidden ? 'qr' : 'hide qr';
     } }, 'qr');
     const modeHint = el('span', { class: 'mute' });
-    const modeBtn = el('button', { onclick: () => {
-      sess.mode = sess.mode === 'rw' ? 'ro' : 'rw';
+    // one-way: only your things. whatever others shared goes (after asking, if there is any)
+    function setMode(mode) {
+      if (mode === 'ro') {
+        remove([...items.values()].filter(it => it.owner !== myId), myId, 'one-way');
+        for (const n of [...notes.values()]) if (n.author !== myId) dropNote(n.id);
+      }
+      sess.mode = mode;
       persist();
       showMode();
-      changed();
+      D.mode = true;
+      dirty();
+    }
+    const modeBtn = el('button', { onclick: () => {
+      if (sess.mode === 'ro') return setMode('rw');
+      const theirs = [...items.values()].filter(it => it.owner !== myId), tn = [...notes.values()].filter(n => n.author !== myId);
+      if (!theirs.length && !tn.length) return setMode('ro');
+      const who = [...new Set([...theirs.map(it => it.owner), ...tn.map(n => n.author)])].map(nameOf);
+      const what = [theirs.length && `${theirs.length} file${theirs.length === 1 ? '' : 's'}`, tn.length && `${tn.length} note${tn.length === 1 ? '' : 's'}`].filter(Boolean).join(' and ');
+      ask(modeBtn, `switch to one-way? this removes ${what} shared by ${who.join(', ')} — their downloads stop`, () => setMode('ro'));
     } });
     const showMode = () => {
       modeBtn.textContent = sess.mode === 'rw' ? 'two-way' : 'one-way';
@@ -1216,13 +1681,23 @@
     // everyone in the share, host first, then who is here, then who isn't
     const peopleEl = el('span', {});
     const showPeople = () => {
-      const list = [...members.values()].filter(m => m.id === myId || online(m.id) || Date.now() - m.lastSeen < RESERVE)
+      const list = [...members.values()].filter(m => m.id === myId || online(m.id) || holds(m.id) || Date.now() - m.lastSeen < RESERVE)
         .sort((a, b) => (b.id === myId) - (a.id === myId) || online(b.id) - online(a.id) || a.name.localeCompare(b.name));
       peopleEl.textContent = list.map(m => m.name + (m.id === myId ? ' (host)' : online(m.id) ? '' : ' (offline)')).join(' · ');
     };
+    // how much of this browser's storage the share's files take
+    const storageEl = el('span', {}, '…');
+    let storageT;
+    const showStorage = () => {
+      clearTimeout(storageT);
+      storageT = setTimeout(async () => {
+        const q = navigator.storage && navigator.storage.estimate && await navigator.storage.estimate().catch(() => null);
+        storageEl.textContent = q ? `${size(q.usage || 0)} used · ${size(Math.max(0, (q.quota || 0) - (q.usage || 0)))} free` : 'unknown';
+      }, 300);
+    };
     const showPeers = () => {
       showPeople();
-      const open = [...peers.values()].filter(p => p.member), r = open.filter(p => p.dc.relay).length;
+      const open = [...peers.values()].filter(p => p.member), r = open.filter(p => p.ctl.relay).length;
       state.textContent = live ? `live · ${open.length} connected${r ? ` (${r} relayed)` : ''}` : 'reconnecting…';
     };
 
@@ -1236,9 +1711,10 @@
           el('span', { class: 'mute' }, 'pin'), el('span', { class: 'row' }, el('span', { class: 'grow' }, pinEl), pinBtn, el('button', { onclick: e => copy(sess.pin, e.target) }, 'copy'), el('button', { onclick: regen }, 'new pin')),
           el('span', { class: 'mute' }, 'mode'), el('span', { class: 'row' }, modeBtn, modeHint),
           el('span', { class: 'mute' }, 'people'), peopleEl,
+          el('span', { class: 'mute' }, 'storage'), storageEl,
         ),
         qrBox,
-        el('p', { class: 'mute' }, 'send the link and pin to someone. a new pin disconnects everyone. sharing stops when you close this tab and resumes when you reopen it.' +
+        el('p', { class: 'mute' }, 'send the link and pin to someone. a new pin disconnects everyone. sharing stops when you close this tab and resumes when you reopen it. your files are kept in this browser; files others add stay on their computer and are only sent when someone gets them.' +
           (coarse() ? ' on a phone, keep this page open in front: browsers pause pages in the background.' : '')),
       ),
       ...v.els,
@@ -1246,9 +1722,23 @@
       el('div', { class: 'row' }, el('span', { class: 'grow' }), el('button', { class: 'link', onclick: e => ask(e.target, 'delete it all & free the name?', end) }, 'stop sharing & delete everything')),
     );
     view = v;
+    shown = true;
     showPeople();
+    showStorage();
     if (selfMsg) say(selfMsg);
-    fill();
+
+    // owners who went away: their things wait GRACE, then go. checked by the clock
+    // (background tabs slow timers down), now and then and whenever the page wakes
+    const sweep = () => {
+      const now = Date.now(), gone = [...items.values()].filter(it => it.off && now - it.off > grace());
+      if (gone.length) remove(gone, null, 'gone');
+    };
+    const sweepT = setInterval(sweep, 15e3);
+    wake.add(sweep);
+    // closing the tab doesn't always close the connections with it: say so, so guests
+    // know at once instead of when their connection times out
+    const leaving = () => { for (const p of peers.values()) tx(p.ctl, { t: 'away' }); };
+    addEventListener('pagehide', leaving);
 
     let live = false;
     const sig = signal(onSignal, () => sig.send({ t: 'host', slug: sess.slug, token: sess.token, pin: sess.pin }));
@@ -1256,15 +1746,19 @@
       announce('gone');
       hosting = null;
       sig.close();
-      for (const p of peers.values()) p.pc.close();
+      clearInterval(sweepT);
+      wake.delete(sweep);
+      removeEventListener('pagehide', leaving);
+      clearTimeout(flushT);
+      for (const x of [...xfers]) x.finish(new Error('closed'));
+      for (const p of peers.values()) { try { p.pc.close(); } catch {} if (p.c) connClosed(p.c); }
       peers.clear();
-      partial.clear();
       unhold();
     };
     sig.onbin = buf => {
       if (buf.byteLength <= 12) return;
       const p = peers.get(dec.decode(new Uint8Array(buf, 0, 12)));
-      if (p && p.dc && p.dc.relay) p.dc.receive(buf.slice(12));
+      if (p && p.relay) p.relay.receive(buf.slice(12));
     };
 
     function onSignal(m) {
@@ -1279,12 +1773,12 @@
           live = false;
           announce('gone');
           hosting = null;
-          for (const p of [...peers.values()]) if (p.dc && p.dc.relay) drop(p.id);
+          for (const p of [...peers.values()]) if (p.relay) drop(p.id);
           return showPeers();
         case 'sig': return onPeerSig(m.from, m.data);
         case 'left': {
           const p = peers.get(m.id);
-          if (p && (!p.open || p.dc.relay)) drop(p.id);
+          if (p && (!p.open || p.relay)) drop(p.id);
           return;
         }
         case 'pinned': return say('new pin set — everyone was disconnected');
@@ -1310,7 +1804,7 @@
       }
       p.q = p.q.then(async () => {
         if (data.relay) return toRelay(p);
-        if (p.dc && p.dc.relay) return;
+        if (p.relay) return;
         if (data.d) {
           if (kp && typeof data.k === 'string') p.key = shared(kp, data.k).catch(() => null);
           await p.pc.setRemoteDescription(data.d);
@@ -1320,22 +1814,46 @@
       }).catch(() => {});
     }
 
+    // hooks for one guest's connection: what the host hands out to it
+    const hooksFor = p => ({
+      // the host's own files, from this browser's storage
+      resolve: async (c, id) => {
+        const it = items.get(id);
+        if (!it || it.kind !== 'stored') throw new Error('not found');
+        const r = await db.get('items', id);
+        if (!r || !r.blob) throw new Error('not found');
+        return { blob: r.blob, size: r.blob.size, mtime: it.mtime };
+      },
+      // in another guest's tab: forwarded (the guests couldn't link directly)
+      proxy: (c, s) => {
+        const it = items.get(s.id);
+        if (!it || it.kind !== 'ref') return false;
+        const o = peers.get(via.get(it.id));
+        if (sess.mode !== 'rw') endServe(s, 'not found');
+        else if (it.owner === p.member) endServe(s, 'not found');
+        else if (it.off || !o || !o.member || !o.c) endServe(s, 'offline');
+        else proxyOpen(c, s, o.c, s.id);
+        return true;
+      },
+    });
+    function attachPeer(p, ctl, bin, max) {
+      p.ctl = ctl;
+      p.bin = bin;
+      p.c = conn(ctl, bin, max, hooksFor(p));
+      ctl.onmessage = ev => onPeerMsg(p, ev.data);
+      bin.onmessage = ev => p.member && onFrame(p.c, ev.data);
+      p.open = true;
+      waitHello(p);
+      showPeers();
+    }
     function addPeer(id) {
       const pc = new RTCPeerConnection({ iceServers: sig.ice });
-      // ups: uploads arriving, saving: uploads being stored, stop: cancelled downloads (all by req)
-      const p = { id, pc, dc: null, open: false, q: Promise.resolve(), ups: new Map(), saving: new Map(), stop: new Set(), rx: {} };
+      const ch = chans(pc);
+      const p = { id, pc, ctl: ch.ctl, bin: ch.bin, c: null, relay: null, open: false, member: null, q: Promise.resolve(), rx: {}, sigs: { n: 100, t: Date.now() } };
       pc.onicecandidate = e => e.candidate && sig.send({ t: 'sig', to: id, data: { c: e.candidate } });
       pc.onconnectionstatechange = () => p.pc === pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed') && drop(id);
-      pc.ondatachannel = e => {
-        if (p.dc) return;
-        const dc = p.dc = e.channel;
-        dc.binaryType = 'arraybuffer';
-        dc.bufferedAmountLowThreshold = LOW;
-        dc.onopen = () => { p.open = true; waitHello(p); showPeers(); };
-        dc.onclose = () => p.dc === dc && drop(id);
-        dc.onmessage = ev => onPeerMsg(p, ev.data).catch(() => {});
-        if (dc.readyState === 'open') dc.onopen();
-      };
+      bothOpen(ch).then(() => { if (peers.get(id) === p && p.pc === pc) attachPeer(p, ch.ctl, ch.bin, pc.sctp && pc.sctp.maxMessageSize); });
+      ch.ctl.onclose = () => p.pc === pc && drop(id);
       peers.set(id, p);
       return p;
     }
@@ -1346,7 +1864,6 @@
       if (!key || peers.get(p.id) !== p) return;
       const old = p.pc, idb = enc.encode(p.id);
       old.onconnectionstatechange = null;
-      p.dc = null;
       old.close();
       let ws = null;
       p.pc = { close: () => { if (ws) ws.close(); } };
@@ -1363,16 +1880,13 @@
         ws.onmessage = e => typeof e.data !== 'string' && ch.receive(e.data);
         ws.onclose = () => ch.close();
       }
-      p.pc = { ...RELAY_PC, close: () => { ch.close(); if (ws) ws.close(); } };
-      p.dc = ch;
-      ch.onmessage = ev => onPeerMsg(p, ev.data).catch(() => {});
+      p.pc = { close: () => { ch.close(); if (ws) ws.close(); } };
+      p.relay = ch;
       ch.onclose = () => drop(p.id);
-      p.open = true;
+      attachPeer(p, ch.ctl, ch.bin, RELAY_MAX);
       // the guest holds its frames until ours arrive (so nothing overtakes its relay
       // socket being set up): say something first, then wait for its hello
-      tx(ch, { t: 'hi' });
-      waitHello(p);
-      showPeers();
+      tx(ch.ctl, { t: 'hi' });
     }
 
     // a separate socket per relayed guest, so one slow guest can't hold up
@@ -1402,7 +1916,7 @@
     const OUTDATED = 'this share was updated — reload the page';
     function outdated(p) {
       p.outdated = true;
-      tx(p.dc, { t: 'err', e: OUTDATED });
+      tx(p.ctl, { t: 'err', e: OUTDATED });
       setTimeout(() => drop(p.id), 300);
     }
     function waitHello(p) {
@@ -1418,6 +1932,7 @@
       if (!name || !sec) return outdated(p);
       p.hello = true;
       clearTimeout(p.helloT);
+      const have = new Set(arr(m.have).slice(0, ITEMS_MAX).filter(id => typeof id === 'string' && ITEM.test(id)));
       helloQ = helloQ.then(async () => {
         const { id, secretHash } = await memberOf(sec), key = nameKey(name);
         if (peers.get(p.id) !== p) return;
@@ -1430,13 +1945,21 @@
         } else if (taken(key)) {
           p.hello = false;
           waitHello(p);
-          return tx(p.dc, { t: 'name-taken', suggest: suggest(name) });
+          return tx(p.ctl, { t: 'name-taken', suggest: suggest(name) });
         } else members.set(id, mb = { id, secretHash, name, key, lastSeen: 0 });
         mb.lastSeen = Date.now();
         keepMember(mb);
         p.member = id;
-        tx(p.dc, { ...ls(), t: 'welcome', you: { id, name: mb.name } });
-        changed();
+        // back again: what this tab still holds comes back online; what no tab holds any more goes
+        for (const it of [...items.values()]) {
+          if (it.owner !== id || it.kind !== 'ref') continue;
+          const holder = peers.get(via.get(it.id));
+          if (holder && holder !== p && holder.member) continue; // another tab of theirs has it
+          if (have.has(it.id)) { via.set(it.id, p.id); if (it.off) { it.off = 0; upItem(it); } }
+          else remove([it], null, 'gone');
+        }
+        tx(p.ctl, { ...snap('welcome'), you: { id, name: mb.name } });
+        memberChanged(id);
         showPeers();
       }).catch(() => {});
     }
@@ -1446,164 +1969,102 @@
       if (!p) return;
       peers.delete(id);
       clearTimeout(p.helloT);
-      // last tab of that member gone: remember when it was last here
-      const mb = p.member && members.get(p.member);
-      if (mb && !online(mb.id)) { mb.lastSeen = Date.now(); keepMember(mb); changed(); }
-      for (const u of p.ups.values()) park(u);
-      p.ups.clear();
-      p.saving.clear(); // stored anyway: the guest can't cancel any more, and finds it there when it resumes
       try { p.pc.close(); } catch {}
+      if (p.c) connClosed(p.c);
+      // what that tab held is offline now: kept GRACE, in case it comes back
+      const now = Date.now();
+      for (const [iid, pid] of via) if (pid === id) { const it = items.get(iid); if (it && !it.off) { it.off = now; upItem(it); } }
+      const mb = p.member && members.get(p.member);
+      if (mb && !online(mb.id)) { mb.lastSeen = now; keepMember(mb); memberChanged(mb.id); }
       showPeers();
-      serve();
     }
 
-    // guest uploads by the guest's upload id. one whose connection drops is kept a
-    // while, so the guest can carry on from where it got to instead of starting over
-    const partial = new Map(), stored = new Set();
-    const serve = () => busy('serve', hot());
-    function forget(u) {
-      clearTimeout(u.ttl);
-      if (u.peer && u.peer.ups.get(u.req) === u) u.peer.ups.delete(u.req);
-      if (partial.get(u.id) === u) partial.delete(u.id);
-      serve();
-    }
-    function park(u) {
-      u.peer = null;
-      if (partial.get(u.id) !== u) return;
-      clearTimeout(u.ttl);
-      u.ttl = setTimeout(() => !u.peer && forget(u), 10 * 6e4);
-    }
-    function keep(u) {
-      if (partial.size >= 16) {
-        let k = partial.keys().next().value; // full: drop the oldest, preferably one nobody is sending
-        for (const [id, x] of partial) if (!x.peer) { k = id; break; }
-        partial.delete(k);
-      }
-      partial.set(u.id, u);
-    }
-    // ok: true stored, false failed, null cancelled while storing
-    const saved = (p, req, ok) => tx(p.dc, ok ? { t: 'ok', req } : { t: 'err', req, e: ok === null ? 'cancelled' : 'host is out of storage' });
+    // token bucket for link signaling: 50 a second, bursts of 100
+    const sigOk = p => {
+      const now = Date.now(), b = p.sigs;
+      b.n = Math.min(100, b.n + (now - b.t) / 20);
+      b.t = now;
+      return --b.n >= 0;
+    };
 
     // everything a guest sends is untrusted
-    async function onPeerMsg(p, data) {
-      if (typeof data !== 'string') {
-        if (data.byteLength < 4) return;
-        const req = new DataView(data).getUint32(0), u = p.ups.get(req);
-        if (!u) return;
-        if (u.got + data.byteLength - 4 > u.size) return forget(u);
-        u.got += data.byteLength - 4;
-        collect(u, new Uint8Array(data, 4));
-        return;
-      }
+    function onPeerMsg(p, data) {
       const m = rx(p.rx, data);
       if (!m) return;
       if (m.t === 'hello') return hello(p, m);
       if (!p.member) return; // nothing else before we know who this is
-      const req = m.req >>> 0, rw = sess.mode === 'rw';
-      const fail = e => tx(p.dc, { t: 'err', req, e });
+      if (xmsg(p.c, m)) return;
+      const rw = sess.mode === 'rw';
       switch (m.t) {
-        case 'get': {
-          const path = clean(m.path);
-          const f = path && files.has(path) && await db.get('files', path);
-          if (!f) return fail('not found');
-          // resuming from an offset: only while it is still the same file
-          const off = Number.isSafeInteger(m.off) && m.off > 0 ? m.off : 0;
-          if (off && (off > f.size || m.size !== f.size || m.mtime !== (+f.mtime || 0))) return fail('the file changed — get it again');
-          serving++;
-          serve();
-          try {
-            if (await stream(p.pc, p.dc, req, f.blob, null, () => p.stop.has(req), off)) tx(p.dc, { t: 'end', req });
-          } catch {
-            fail('could not read the file'); // (a no-op if it was the connection that went)
-          } finally {
-            p.stop.delete(req);
-            serving--;
-            serve();
+        case 'sync': return tx(p.ctl, snap('snap'));
+        case 'away': return drop(p.id); // its tab is closing
+        case 'add': {
+          if (!rw) return tx(p.ctl, { t: 'added', paths: {}, no: arr(m.items).map(x => x && x.id).filter(id => ITEM.test(id)).slice(0, ITEMS_MAX) });
+          const ok = [], no = [];
+          let count = [...items.values()].filter(it => it.owner === p.member).length;
+          for (const x of arr(m.items).slice(0, ITEMS_MAX)) {
+            if (!x || !ITEM.test(x.id)) continue;
+            const path = clean(x.path), cur = items.get(x.id);
+            if (!path || !Number.isSafeInteger(x.size) || x.size < 0 || (x.fp != null && !HASH.test(x.fp)) || tomb.has(x.id) || (cur && cur.owner !== p.member) || (!cur && count >= ITEMS_MAX)) { no.push(x.id); continue; }
+            if (!cur) count++;
+            ok.push({ id: x.id, path, size: x.size, mtime: Number.isSafeInteger(x.mtime) ? x.mtime : 0, fp: x.fp || null });
           }
-          return;
-        }
-        // uploads and downloads are cancelled separately (up: true / false), so one can
-        // never stop the other. guests from before this don't say: try uploads first
-        case 'cancel': {
-          if (m.up !== false) {
-            const u = p.ups.get(req), s = p.saving.get(req);
-            if (u) return forget(u);
-            if (s) return s.ctl.abort(); // rolls back the write; 'end' below answers
-            if (m.up === true) return;
-          }
-          if (p.stop.size < 64) p.stop.add(req);
-          return;
-        }
-        case 'put': {
-          if (!rw) return fail('read-only share');
-          const path = clean(m.path), id = typeof m.id === 'string' && /^[a-z0-9]{12}$/.test(m.id) ? m.id : null;
-          // the guest lost its connection mid-upload and is back: say how far it got
-          if (id && m.resume) {
-            const old = partial.get(id);
-            if (stored.has(id)) return tx(p.dc, { t: 'ok', req });
-            if (old && old.saving) return void old.saving.then(ok => saved(p, req, ok));
-            if (old && old.path === path && old.size === m.size && p.ups.size < 8) {
-              if (old.peer) old.peer.ups.delete(old.req); // late frames from the old connection are ignored
-              clearTimeout(old.ttl);
-              old.peer = p;
-              old.req = req;
-              p.ups.set(req, old);
-              serve();
-              return tx(p.dc, { t: 'at', req, off: old.got });
-            }
-          }
-          if (!path || !Number.isSafeInteger(m.size) || m.size < 0 || p.ups.size >= 8) return fail('rejected');
-          const u = { id: id && !partial.has(id) ? id : null, path, size: m.size, mtime: m.mtime, parts: [], got: 0, peer: p, req };
-          p.ups.set(req, u); // before any await: chunks follow at once
-          if (u.id) keep(u);
-          serve();
-          if (m.resume) tx(p.dc, { t: 'at', req, off: 0 }); // nothing kept: start over
-          const q = navigator.storage && navigator.storage.estimate && await navigator.storage.estimate().catch(() => null);
-          if (q && q.quota - q.usage < m.size) { forget(u); return fail('host is out of storage'); }
-          return;
-        }
-        case 'end': {
-          const u = p.ups.get(req);
-          if (!u) return;
-          if (u.got !== u.size) { forget(u); return fail('upload incomplete'); }
-          p.ups.delete(req);
-          // still addressable while it is stored, so a cancel now undoes it
-          u.ctl = new AbortController();
-          p.saving.set(req, u);
-          serve();
-          // a guest that reconnects while this is being stored waits for the same result
-          u.saving = src.put(new Blob(u.parts), u.path, u.mtime, null, null, u.ctl.signal, p.member).then(() => true, () => u.ctl.signal.aborted ? null : false);
-          const ok = await u.saving;
-          if (p.saving.get(req) === u) p.saving.delete(req);
-          forget(u);
-          if (ok && u.id) {
-            stored.add(u.id);
-            if (stored.size > 64) stored.delete(stored.values().next().value);
-          }
-          return saved(p, req, ok);
+          const where = place(ok, p.member, typeof m.dir === 'string' ? clean(m.dir) : null), out = {};
+          ok.forEach((x, k) => {
+            const path = where[k];
+            if (!path) return no.push(x.id);
+            // the same name of theirs: the new one replaces it
+            const old = items.get(paths.get(path));
+            if (old && old.id !== x.id && old.owner === p.member) remove([old], p.member, 'replaced');
+            const cur = items.get(x.id);
+            if (cur && cur.path !== path && paths.get(cur.path) === cur.id) paths.delete(cur.path);
+            via.set(x.id, p.id);
+            putItem({ ...x, path, owner: p.member, kind: 'ref', off: 0 });
+            out[x.id] = path;
+          });
+          return tx(p.ctl, { t: 'added', paths: out, no });
         }
         case 'rm': {
-          if (!rw) return fail('read-only share');
-          const path = clean(m.path);
-          if (path) await src.rm(path, m.dir === true);
+          if (!rw) return;
+          let list = [];
+          if (Array.isArray(m.ids)) list = m.ids.slice(0, ITEMS_MAX).map(id => typeof id === 'string' && items.get(id));
+          else {
+            const path = clean(m.path);
+            if (path && m.dir === true) list = [...items.values()].filter(it => it.path.startsWith(path + '/'));
+            else if (path) list = [items.get(paths.get(path))];
+          }
+          return remove(list, p.member);
+        }
+        case 'note': {
+          if (!rw) return;
+          const e = doNote(m.title, m.text, typeof m.id === 'string' ? m.id : null, p.member);
+          if (e) tx(p.ctl, { t: 'err', e });
           return;
         }
-        case 'note': return rw ? src.note(m.title, m.text, typeof m.id === 'string' ? m.id : null, p.member) : fail('read-only share');
-        case 'unnote': return !rw ? fail('read-only share') : notes.has(m.id) && src.unnote(m.id);
+        case 'unnote': return rw && typeof m.id === 'string' && notes.has(m.id) && dropNote(m.id);
+        // link signaling between two guests, only through here: the host vouches for both ends
+        case 'peer-sig': {
+          if (!rw || !MEMBER.test(m.to) || m.to === p.member || !m.data || typeof m.data !== 'object' || !sigOk(p)) return;
+          if (JSON.stringify(m.data).length > 32e3) return;
+          const to = peersOf(m.to).pop();
+          if (to) tx(to.ctl, { t: 'peer-sig', from: p.member, data: m.data });
+          return;
+        }
       }
     }
 
     function kickAll(why) {
       for (const p of peers.values()) {
-        tx(p.dc, { t: 'bye', why });
+        tx(p.ctl, { t: 'bye', why });
         setTimeout(() => drop(p.id), 300);
       }
     }
+    // a new pin: everyone is out, and what they shared goes at once (their notes stay)
     function regen() {
       sess.pin = newPin();
-      partial.clear(); // whoever was uploading needs the new pin first anyway
       persist();
       showPin();
+      remove([...items.values()].filter(it => it.kind === 'ref'), null, 'pin');
       sig.send({ t: 'pin', pin: sess.pin });
       kickAll('revoked');
     }
@@ -1612,6 +2073,7 @@
       kickAll('ended');
       sig.send({ t: 'end' });
       delHost(sess.slug);
+      store.del(TOMB);
       await db.clear().catch(() => {});
       setTimeout(() => nav('/'), 400);
     }
@@ -1622,9 +2084,11 @@
   function guest(slug) {
     document.title = slug + ' · p2p';
     const key = 'p2p:g:' + slug;
-    const files = new Map(), notes = new Map(), members = new Map(), pend = new Map();
-    // transfers outlive a dropped connection and carry on from where they got to on the
-    // next one; notes and deletes made meanwhile wait in the outbox
+    const items = new Map(), notes = new Map(), members = new Map();
+    // what this tab shares (two-way): id → { f: File, meta }. only ever in this tab
+    const mine = new Map();
+    // downloads outlive a dropped connection and carry on from where they got to on
+    // the next one; notes and deletes made meanwhile wait in the outbox
     const xfers = new Set(), outbox = [];
     // p2p:g:<slug> = { pin, name } (name: only when it differs from your usual one).
     // older versions stored just the pin
@@ -1632,8 +2096,8 @@
     let pin = typeof kept === 'string' ? kept : kept && typeof kept.pin === 'string' ? kept.pin : null;
     let myname = (kept && normName(kept.name)) || myName(), myId = null, secret = null;
     const remember = () => store.set(key, myname === myName() ? { pin } : { pin, name: myname });
-    let mode = 'ro', sig = null, pc = null, dc = null, rxs = {}, n = 0, timer = null, v = null;
-    let ready = false, retrying = false, hostV = 0, relayed = false;
+    let mode = 'ro', sig = null, pc = null, ctl = null, hostC = null, rxs = {}, timer = null, v = null, ice = [], rev = 0;
+    let ready = false, retrying = false, relayed = false;
     const unhold = hold();
 
     const state = el('span', { class: 'mute' });
@@ -1641,21 +2105,26 @@
     const say = t => { status.textContent = t; };
     const head = el('div', { class: 'row' }, el('h1', { class: 'grow' }, el('a', { href: '/' }, 'p2p'), ' /' + slug), state);
 
-    // keep: a reconnect follows, so transfers and the outbox wait for it
+    // keep: a reconnect follows, so downloads and the outbox wait for it
     function teardown(keep) {
       clearTimeout(timer);
       ready = retrying = false;
-      const s = sig, p = pc;
-      sig = pc = dc = null;
+      const s = sig, p = pc, c = hostC;
+      sig = pc = ctl = hostC = null;
       if (s) s.close();
       if (p) p.close();
-      pend.clear();
+      if (c) connClosed(c);
       rxs = {};
       if (keep) return;
-      for (const x of [...xfers]) finish(x, new Error('disconnected'));
+      for (const x of [...xfers]) x.finish(new Error('disconnected'));
       outbox.length = 0;
+      closeLinks();
     }
-    const quit = () => { teardown(); unhold(); wake.delete(onWake); };
+    const quit = () => { teardown(); mine.clear(); unhold(); wake.delete(onWake); clearInterval(linkT); removeEventListener('pagehide', leaving); };
+    // closing the tab doesn't always close the connection with it: say so, so the host
+    // marks our files offline at once instead of when the connection times out
+    const leaving = () => tx(ctl, { t: 'away' });
+    addEventListener('pagehide', leaving);
     cleanup = quit;
     // back in front or online: retry now instead of when the (slowed down) timer fires
     function onWake() {
@@ -1730,7 +2199,7 @@
       state.textContent = v ? 'reconnecting…' : 'connecting…';
       if (!v) app.replaceChildren(head, status);
       if (!xfers.size) say('');
-      const s = sig = signal(m => sig === s && onSignal(m), () => s.send({ t: 'join', slug, pin }));
+      const s = sig = signal(m => sig === s && onSignal(m), () => { ice = s.ice; s.send({ t: 'join', slug, pin }); });
       timer = setTimeout(() => wait('could not reach the other browser directly — retrying…', 3000), 25000);
     }
 
@@ -1744,7 +2213,7 @@
           p.q = p.q.then(() => d.d ? p.setRemoteDescription(d.d) : d.c ? p.addIceCandidate(d.c) : 0).catch(() => {});
           return;
         }
-        case 'down': if (dc && dc.relay) wait('connection lost — reconnecting…', 1000); return;
+        case 'down': if (ctl && ctl.relay) wait('connection lost — reconnecting…', 1000); return;
         case 'revoked': store.del(key); return form('access was revoked — ask for the new pin');
         case 'ended': store.del(key); return form('this share has ended');
         case 'err':
@@ -1758,6 +2227,14 @@
       }
     }
 
+    // the connection to the host: two channels, then hello
+    function opened(c, b, max) {
+      ctl = c;
+      hostC = conn(c, b, max, hooks);
+      c.onmessage = e => onMsg(e.data);
+      b.onmessage = e => hostC && onFrame(hostC, e.data);
+      tx(ctl, { t: 'hello', v: 3, name: myname, secret, have: [...mine.keys()].slice(0, ITEMS_MAX) });
+    }
     async function startRtc() {
       if (pc) pc.close();
       const s = sig, kp = await keypair().catch(() => null);
@@ -1765,32 +2242,30 @@
       const p = pc = new RTCPeerConnection({ iceServers: s.ice });
       p.q = Promise.resolve();
       p.kp = kp;
-      const ch = dc = p.createDataChannel('fs', { ordered: true });
-      ch.binaryType = 'arraybuffer';
-      ch.bufferedAmountLowThreshold = LOW;
+      const ch = chans(p);
       p.onicecandidate = e => e.candidate && sig && sig.send({ t: 'sig', data: { c: e.candidate } });
-      let opened = false;
-      const lost = p.lost = () => pc === p && (opened ? wait('connection lost — reconnecting…', 1000) : toRelay(p));
+      let isOpen = false;
+      const lost = p.lost = () => pc === p && (isOpen ? wait('connection lost — reconnecting…', 1000) : toRelay(p));
       // after 6s use the relay (2.5s if the last connection needed it too), unless a direct
       // (or turn) path was already found and is just finishing its handshake: then give it up to 15s in total
-      const late = () => pc === p && !opened && toRelay(p);
+      const late = () => pc === p && !isOpen && toRelay(p);
       setTimeout(() => /^(connected|completed)$/.test(p.iceConnectionState) ? setTimeout(late, 9000) : late(), relayed ? 2500 : 6000);
       // a path that stays down for 6s rarely comes back by itself: reconnect, transfers resume
       p.onconnectionstatechange = p.oniceconnectionstatechange = () => {
         const st = p.connectionState || p.iceConnectionState;
         clearTimeout(p.down);
         if (st === 'failed') lost();
-        else if (st === 'disconnected' && opened) p.down = setTimeout(() => /^(disconnected|failed)$/.test(p.connectionState || p.iceConnectionState) && lost(), 6000);
+        else if (st === 'disconnected' && isOpen) p.down = setTimeout(() => /^(disconnected|failed)$/.test(p.connectionState || p.iceConnectionState) && lost(), 6000);
       };
-      ch.onopen = () => {
-        opened = true;
+      bothOpen(ch).then(() => {
+        if (pc !== p) return;
+        isOpen = true;
         relayed = false;
         clearTimeout(timer);
         if (sig) { sig.close(); sig = null; } // direct from here on
-        hello();
-      };
-      ch.onclose = lost;
-      ch.onmessage = e => onMsg(e.data);
+        opened(ch.ctl, ch.bin, p.sctp && p.sctp.maxMessageSize);
+      });
+      ch.ctl.onclose = lost;
       await p.setLocalDescription(await p.createOffer());
       if (sig) sig.send({ t: 'sig', data: { d: p.localDescription, k: kp && kp.pub } });
     }
@@ -1804,39 +2279,71 @@
       // socket is set up, so nothing can overtake on the way
       let held = [];
       const s = sig, ch = new Relay(k, 0, msg => held ? held.push(msg) : s.bin(msg), s.buffered);
-      pc = { ...RELAY_PC, close: () => ch.close() };
-      dc = ch;
+      pc = { close: () => ch.close() };
       relayed = true;
       p.close();
-      ch.onmessage = e => onMsg(e.data);
-      ch.onclose = () => dc === ch && wait('connection lost — reconnecting…', 1000);
+      ch.onclose = () => ctl === ch.ctl && wait('connection lost — reconnecting…', 1000);
       s.onbin = buf => {
         if (held) { for (const m of held) s.bin(m); held = null; }
         ch.receive(buf);
       };
       s.send({ t: 'sig', data: { relay: 1 } });
       clearTimeout(timer);
-      hello();
+      opened(ch.ctl, ch.bin, RELAY_MAX);
     }
 
-    // first thing on every connection: who we are. only over the encrypted channel,
-    // never through the server. the host answers welcome or name-taken
-    function hello() {
-      tx(dc, { t: 'hello', v: 3, name: myname, secret, have: [] });
-    }
-    function onMsg(data) {
-      if (typeof data !== 'string') {
-        if (data.byteLength < 4) return;
-        const x = pend.get(new DataView(data).getUint32(0));
-        if (!x || x.up) return;
-        collect(x, new Uint8Array(data, 4));
-        x.got += data.byteLength - 4;
-        if (x.prog) x.prog(x.got);
-        return;
+    // ---- the listing: a snapshot, then numbered changes
+    const okItem = x => x && ITEM.test(x.id) && clean(x.path) === x.path && Number.isSafeInteger(x.size) && x.size >= 0 && MEMBER.test(x.owner)
+      && { id: x.id, path: x.path, size: x.size, mtime: Number.isSafeInteger(x.mtime) ? x.mtime : 0, fp: HASH.test(x.fp) ? x.fp : null, owner: x.owner, kind: x.kind === 'stored' ? 'stored' : 'ref', off: Number.isSafeInteger(x.off) && x.off > 0 ? x.off : 0 };
+    const okNote = x => x && typeof x.id === 'string' && x.id.length <= 32 && typeof x.title === 'string' && typeof x.text === 'string' && x.text.length <= NOTE_MAX
+      && { id: x.id, title: x.title.slice(0, TITLE_MAX), text: x.text, t: +x.t || 0, author: MEMBER.test(x.author) ? x.author : null, editor: MEMBER.test(x.editor) ? x.editor : null };
+    const okMember = x => { const nm = x && normName(x.name); return nm && MEMBER.test(x.id) && { id: x.id, name: nm, online: !!x.online, offlineSince: +x.offlineSince || 0 }; };
+    const nameOf = id => id === myId ? 'you' : (members.get(id) || {}).name || 'someone';
+    function setMode(m) {
+      const was = mode;
+      mode = m === 'rw' ? 'rw' : 'ro';
+      if (mode === 'ro' && mine.size) {
+        // the host is not on our direct links, so we stop serving ourselves
+        mine.clear();
+        closeLinks();
+        if (was === 'rw') say('the host switched to one-way — your shared files were removed');
       }
+      if (mode === 'ro') closeLinks();
+    }
+    function snapshot(m) {
+      members.clear();
+      for (const x of arr(m.members)) { const o = okMember(x); if (o) members.set(o.id, o); }
+      items.clear();
+      for (const x of arr(m.items)) { const o = okItem(x); if (o) items.set(o.id, o); }
+      notes.clear();
+      for (const x of arr(m.notes)) { const o = okNote(x); if (o) notes.set(o.id, o); }
+      rev = Number.isSafeInteger(m.rev) ? m.rev : 0;
+      for (const id of arr(m.tomb)) mine.delete(id);
+      setMode(m.mode);
+      // ours that the host doesn't list any more (it dropped them while we were away): again
+      const again = [...mine].filter(([id]) => !items.has(id)).map(([, x]) => x.meta);
+      if (again.length && mode === 'rw') post({ t: 'add', items: again });
+    }
+    function delta(m) {
+      if (m.rev !== rev + 1) { if (m.rev > rev) tx(ctl, { t: 'sync' }); return; } // missed one: start over from a snapshot
+      rev = m.rev;
+      const it = m.items || {}, nt = m.notes || {}, mb = m.members || {};
+      for (const x of [...arr(it.add), ...arr(it.up)]) { const o = okItem(x); if (o) items.set(o.id, o); }
+      for (const id of arr(it.rm)) items.delete(id);
+      for (const x of arr(nt.up)) { const o = okNote(x); if (o) notes.set(o.id, o); }
+      for (const id of arr(nt.rm)) notes.delete(id);
+      for (const x of arr(mb.up)) { const o = okMember(x); if (o) members.set(o.id, o); }
+      for (const id of arr(mb.rm)) members.delete(id);
+      if (m.mode) setMode(m.mode);
+    }
+    function showState() {
+      state.textContent = `connected as ${myname} · ` + (mode === 'rw' ? 'two-way' : 'one-way') + (ctl && ctl.relay ? ' · relayed' : '');
+    }
+
+    function onMsg(data) {
       const m = rx(rxs, data);
       if (!m) return;
-      const x = pend.get(m.req);
+      if (ready && xmsg(hostC, m)) return;
       switch (m.t) {
         case 'name-taken': {
           const taken = myname, sug = normName(m.suggest);
@@ -1847,128 +2354,193 @@
           myId = m.you.id;
           myname = normName(m.you.name) || myname;
           remember();
+          snapshot(m);
           show();
-          // falls through: the rest is a listing
-        case 'ls':
-          members.clear();
-          for (const x of arr(m.members)) {
-            const nm = x && normName(x.name);
-            if (nm && MEMBER.test(x.id)) members.set(x.id, { id: x.id, name: nm, online: !!x.online, offlineSince: +x.offlineSince || 0 });
-          }
-          mode = m.mode === 'rw' ? 'rw' : 'ro';
-          files.clear();
-          for (const f of arr(m.files)) {
-            const path = f && clean(f.path);
-            if (path && Number.isSafeInteger(f.size) && f.size >= 0) files.set(path, { path, size: f.size, mtime: +f.mtime || 0, hash: HASH.test(f.hash) ? f.hash : null, owner: MEMBER.test(f.owner) ? f.owner : null });
-          }
-          notes.clear();
-          for (const x of arr(m.notes)) {
-            if (x && typeof x.id === 'string' && typeof x.title === 'string' && typeof x.text === 'string' && x.text.length <= NOTE_MAX) notes.set(x.id, { id: x.id, title: x.title.slice(0, TITLE_MAX), text: x.text, t: +x.t || 0, author: MEMBER.test(x.author) ? x.author : null, editor: MEMBER.test(x.editor) ? x.editor : null });
-          }
-          if (!myId) return; // a listing before welcome: not ours to show yet
-          state.textContent = `connected as ${myname} · ` + (mode === 'rw' ? 'two-way' : 'one-way') + (dc && dc.relay ? ' · relayed' : '');
-          if (!ready) {
-            // first listing on this connection: carry on with whatever was going before
-            ready = true;
-            hostV = +m.v || 0;
-            for (const t of xfers) begin(t);
-            for (const o of outbox.splice(0)) tx(dc, o);
+          showState();
+          // first listing on this connection: carry on with whatever was going before
+          ready = true;
+          for (const o of outbox.splice(0)) tx(ctl, o);
+          kick(xfers);
+          return v.refresh();
+        case 'snap':
+          if (!ready) return;
+          snapshot(m);
+          showState();
+          kick(xfers);
+          return v.refresh();
+        case 'delta':
+          if (!ready) return;
+          delta(m);
+          showState();
+          kick(xfers);
+          return v.refresh();
+        case 'added':
+          for (const id of arr(m.no)) mine.delete(id);
+          if (arr(m.no).length) say(`${arr(m.no).length} file${arr(m.no).length === 1 ? '' : 's'} could not be shared`);
+          return v && v.refresh();
+        // taken out of the share by someone (our file on disk is untouched)
+        case 'unshared': {
+          const ids = arr(m.ids).filter(id => mine.has(id));
+          for (const id of ids) mine.delete(id);
+          if (m.why === 'one-way') { mine.clear(); closeLinks(); say('the host switched to one-way — your shared files were removed'); }
+          else if (ids.length && m.by !== myId) {
+            const it = items.get(ids[0]);
+            say(`${nameOf(m.by)} removed ${ids.length > 1 ? ids.length + ' of your files' : it ? it.path.split('/').pop() : 'a file of yours'}`);
           }
           return v && v.refresh();
-        case 'at': if (x && x.up && Number.isSafeInteger(m.off) && m.off >= 0 && m.off <= x.blob.size) pump(x, m.off); return;
-        case 'end': if (x && !x.up) finish(x, null, new Blob(x.parts)); return;
-        // cancelled while the host was storing it: its answer says which won
-        case 'ok': if (x && x.up) finish(x, x.reason && Object.assign(new Error('already saved'), { saved: true })); return;
+        }
+        case 'peer-sig': return onPeerSig(m.from, m.data);
         case 'err':
-          if (x) finish(x, x.reason || new Error(String(m.e).slice(0, 100)));
-          else if (m.req == null) say('error: ' + String(m.e).slice(0, 100)); // replies to cancelled requests are expected
+          say('error: ' + String(m.e).slice(0, 100));
           return;
         case 'bye':
           store.del(key);
           return form(m.why === 'ended' ? 'this share has ended' : 'access was revoked — ask for the new pin');
+        case 'away': return wait(`the owner of /${slug} closed the share — waiting for them…`, 5000);
       }
     }
 
-    function finish(x, err, val) {
-      clearTimeout(x.wait);
-      if (!xfers.delete(x)) return;
-      if (pend.get(x.req) === x) pend.delete(x.req);
-      err ? x.rej(err) : x.res(val);
-    }
-    function transfer(x, signal) {
-      return new Promise((res, rej) => {
-        if (signal && signal.aborted) return rej(signal.reason);
-        x.res = res;
-        x.rej = rej;
-        xfers.add(x);
-        if (signal) signal.addEventListener('abort', () => {
-          const live = xfers.has(x) && pend.get(x.req) === x;
-          if (live) tx(dc, { t: 'cancel', req: x.req, up: !!x.up });
-          // all sent: the host may be storing it already. wait (a little) for it to
-          // say whether the cancel stopped that or came too late
-          if (live && x.up && x.ended) {
-            x.reason = signal.reason;
-            x.wait = setTimeout(() => finish(x, signal.reason), 5000);
-            return;
-          }
-          finish(x, signal.reason);
-        }, { once: true });
-        begin(x);
-      });
-    }
-    // (re)start a transfer on the current connection, from where it got to
-    function begin(x) {
-      if (x.reason) return finish(x, x.reason); // cancelled while the host was storing it; the connection went first
-      if (!ready || !dc || dc.readyState !== 'open') return; // the next connection starts it
-      const req = x.req = ++n;
-      pend.set(req, x);
-      if (!x.up) {
-        if (hostV < 2) { x.parts = []; x.got = x.mem = 0; } // this host can't resume: start over
-        return tx(dc, { t: 'get', req, path: x.path, off: x.got, size: x.size, mtime: x.mtime });
-      }
-      // first try: the bytes follow the request at once. after a reconnect: wait for
-      // the host to say how much it already has ('at')
-      const resume = x.sent && hostV >= 2;
-      x.sent = true;
-      x.ended = false;
-      tx(dc, { t: 'put', req, path: x.path, size: x.blob.size, mtime: x.mtime, id: x.id, resume });
-      if (!resume) pump(x, 0);
-    }
-    function pump(x, off) {
-      const c = dc, req = x.req;
-      stream(pc, c, req, x.blob, x.prog, () => x.req !== req || !xfers.has(x), off).then(async all => {
-        if (!all) return;
-        tx(c, { t: 'end', req });
-        x.ended = true;
-        // once the last byte has left, the host is storing it
-        while (c.readyState === 'open' && c.bufferedAmount > 0 && x.req === req && xfers.has(x)) {
-          if (x.prog) x.prog(x.blob.size - c.bufferedAmount);
-          await new Promise(r => setTimeout(r, 50));
-        }
-        if (x.req === req && xfers.has(x) && x.prog) x.prog(x.blob.size, true);
-      }, e => {
-        if (c.readyState !== 'open' || x.req !== req) return; // connection dropped: begin() picks it up again
-        tx(c, { t: 'cancel', req, up: true }); // the file itself can't be read (moved, changed)
-        finish(x, e);
-      });
-    }
     // notes and deletes made while reconnecting go out once connected again
     function post(m) {
-      if (ready && dc && dc.readyState === 'open') return tx(dc, m);
+      if (ready && ctl && ctl.readyState === 'open') return tx(ctl, m);
       if (outbox.length < 100) outbox.push(m);
       say('not connected — will send when reconnected');
     }
 
+    // ---- serving our own files: to the host, and over links to other guests
+    const hooks = {
+      resolve: async (c, id) => {
+        const it = items.get(id), x = mine.get(id);
+        if (mode !== 'rw' || !x || !it || it.owner !== myId) throw new Error('not found');
+        return { blob: x.f, size: x.f.size, mtime: it.mtime };
+      },
+      // moved or changed on disk: it can't be served any more
+      gone: id => {
+        const it = items.get(id);
+        if (!mine.delete(id)) return;
+        post({ t: 'rm', ids: [id] });
+        say(`${it ? it.path.split('/').pop() : 'a file'} changed or moved on your computer — removed from the share`);
+      },
+    };
+
+    // ---- direct links to other guests, set up through the host
+    // (perfect negotiation: the lower member id is the polite side and gives way when
+    // both dial at once). opened on demand, closed when idle
+    const links = new Map(), noDirect = new Map();
+    function killLink(l) {
+      if (l.dead) return;
+      l.dead = true;
+      if (links.get(l.id) === l) links.delete(l.id);
+      try { l.pc.close(); } catch {}
+      if (l.c) connClosed(l.c);
+    }
+    function closeLinks() { for (const l of [...links.values()]) killLink(l); }
+    const idleLink = l => !l.c || (!l.c.pulls.size && !l.c.serves.size);
+    const linkT = setInterval(() => { for (const l of [...links.values()]) if (idleLink(l) && Date.now() - (l.c ? l.c.used : l.born) > LINK_IDLE) killLink(l); }, 3e4);
+    const sendSig = (to, data) => ready && tx(ctl, { t: 'peer-sig', to, data });
+    function getLink(id, passive) {
+      let l = links.get(id);
+      if (l && !l.dead) return l;
+      if (links.size >= LINKS_MAX) {
+        const old = [...links.values()].filter(idleLink).sort((a, b) => (a.c ? a.c.used : a.born) - (b.c ? b.c.used : b.born))[0];
+        if (!old) return null;
+        killLink(old);
+      }
+      const pc = new RTCPeerConnection({ iceServers: ice }), ch = chans(pc);
+      l = { id, pc, polite: myId < id, making: false, ignore: false, open: false, dead: false, c: null, q: Promise.resolve(), born: Date.now(), rx: {}, passive };
+      l.ready = bothOpen(ch).then(() => {
+        if (l.dead) return false;
+        l.open = true;
+        l.c = conn(ch.ctl, ch.bin, pc.sctp && pc.sctp.maxMessageSize, hooks);
+        return true;
+      });
+      // only transfers on a link; nothing else is listened to
+      ch.ctl.onmessage = e => { const m = l.c && rx(l.rx, e.data); if (m) xmsg(l.c, m); };
+      ch.bin.onmessage = e => l.c && onFrame(l.c, e.data);
+      ch.ctl.onclose = () => killLink(l);
+      pc.onicecandidate = e => e.candidate && sendSig(id, { c: e.candidate });
+      pc.onnegotiationneeded = async () => {
+        if (l.passive || pc.signalingState !== 'stable') return; // the other side's offer covers it
+        try { l.making = true; await pc.setLocalDescription(); sendSig(id, { d: pc.localDescription }); } catch {} finally { l.making = false; }
+      };
+      pc.onconnectionstatechange = () => /^(failed|closed)$/.test(pc.connectionState) && killLink(l);
+      links.set(id, l);
+      return l;
+    }
+    function onPeerSig(from, data) {
+      if (!MEMBER.test(from) || from === myId || !data || typeof data !== 'object' || mode !== 'rw') return;
+      let l = links.get(from);
+      if (!l || l.dead) {
+        if (!data.d || data.d.type !== 'offer') return;
+        l = getLink(from, true);
+        if (!l) return; // too many links: they'll go through the host
+      }
+      l.q = l.q.then(async () => {
+        if (data.d) {
+          const d = data.d;
+          if (!/^(offer|answer)$/.test(d.type) || typeof d.sdp !== 'string' || d.sdp.length > 3e4) return;
+          const collision = d.type === 'offer' && (l.making || l.pc.signalingState !== 'stable');
+          l.ignore = !l.polite && collision;
+          if (l.ignore) return;
+          await l.pc.setRemoteDescription({ type: d.type, sdp: d.sdp });
+          if (d.type === 'offer') { await l.pc.setLocalDescription(); sendSig(from, { d: l.pc.localDescription }); }
+        } else if (data.c && typeof data.c === 'object') {
+          try { await l.pc.addIceCandidate(data.c); } catch (e) { if (!l.ignore) throw e; }
+        }
+      }).catch(() => {});
+    }
+    // a link to an owner, if one opens within DIRECT_WAIT; else null (go through the host).
+    // after a failure, the host route is used for a while before trying direct again
+    async function viaLink(owner) {
+      if (mode !== 'rw' || (noDirect.get(owner) || 0) > Date.now()) return null;
+      const l = getLink(owner);
+      if (!l) return null;
+      if (l.open) return l;
+      const ok = await Promise.race([l.ready, new Promise(r => setTimeout(() => r(false), DIRECT_WAIT))]);
+      if (ok && l.open && !l.dead) return l;
+      noDirect.set(owner, Date.now() + 2 * 6e4);
+      killLink(l);
+      return null;
+    }
+
+    // ---- downloads: the host's files from the host; another guest's directly, or through the host
+    async function route(x) {
+      const it = items.get(x.id);
+      if (!ready || !hostC) return { wait: '' };
+      if (!it) return { fail: 'not available any more', gone: true };
+      if (it.off) return { wait: nameOf(it.owner) };
+      if (it.kind === 'ref' && it.owner !== myId) {
+        const l = await viaLink(it.owner);
+        if (!xfers.has(x)) return true;
+        if (l && l.c) { attempt(l.c, x); return true; }
+        if (!ready || !hostC) return { wait: '' };
+      }
+      attempt(hostC, x);
+      return true;
+    }
+
     const src = {
-      files, notes, members,
+      items, notes, members, verb: 'share',
       me: () => myId,
       writable: () => mode === 'rw',
-      get: (path, prog, signal) => {
-        const f = files.get(path) || {};
-        return transfer({ path, size: f.size, mtime: f.mtime, parts: [], got: 0, prog }, signal);
+      offline: it => it.off || 0,
+      hint: () => mine.size ? 'your files are shared from this tab — keep it open' : null,
+      // two-way: only names and sizes go to the host; the bytes stay here until someone gets them
+      add: async (list, sig, say, dir) => {
+        const out = list.map(it => ({ id: newId(), path: it.path, size: it.f.size, mtime: Number.isSafeInteger(it.f.lastModified) ? it.f.lastModified : Date.now(), fp: it.fp }));
+        for (const o of out) for (const it of items.values()) if (it.path === o.path && it.owner === myId) mine.delete(it.id); // replaced
+        out.forEach((o, k) => mine.set(o.id, { f: list[k].f, meta: o }));
+        post({ t: 'add', items: out, dir: dir || undefined });
+        v.refresh();
+        return { done: out.length };
       },
-      put: (blob, path, mtime, prog, hash, signal) => transfer({ up: true, id: newId(), blob, path, mtime, prog }, signal),
-      rm: async (path, dir) => post({ t: 'rm', path, dir: !!dir }),
+      fetch: (it, sink, prog, sig, waiting) => {
+        const x = mine.get(it.id);
+        if (x && it.owner === myId) return sink.whole(x.f);
+        return download(it, sink, prog, sig, waiting, route, xfers);
+      },
+      rm: ids => { for (const id of ids) mine.delete(id); post({ t: 'rm', ids }); },
+      rmDir: path => post({ t: 'rm', path, dir: true }),
       note: async (title, text, id) => post({ t: 'note', title, text, id }),
       unnote: async id => post({ t: 'unnote', id }),
     };
@@ -1977,7 +2549,7 @@
       if (v) return v.refresh();
       v = view = panel(src, say, status);
       app.replaceChildren(head, ...v.els, v.foot,
-        el('div', { class: 'row' }, el('span', { class: 'grow' }), el('button', { class: 'link', onclick: () => { store.del(key); form('disconnected'); } }, 'disconnect')));
+        el('div', { class: 'row' }, el('span', { class: 'grow' }), el('button', { class: 'link', onclick: () => { store.del(key); mine.clear(); form('disconnected'); } }, 'disconnect')));
       say('');
     }
 
