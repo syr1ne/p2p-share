@@ -56,6 +56,41 @@
   const newId = () => Array.from({ length: 12 }, () => ABC[rnd(ABC.length)]).join('');
   const newToken = () => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const b64u = u8 => btoa(String.fromCharCode(...u8)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  // ---- who you are ----------------------------------------------------------
+  // every participant has a display name. left empty, a random readable one is
+  // used: made once and kept, so it doesn't change between visits
+  const ADJ = 'amber bold brave brisk calm clever cosy crisp curly dapper eager fair fancy fond fresh gentle glad golden grand happy hazy jolly keen kind lively lucky merry mild misty neat nimble noble odd plain polite proud quick quiet rapid rosy rustic shy silent silly sleek smart snowy soft spry steady sunny swift tidy tiny upbeat vivid warm wavy wild wise witty young zany zesty'.split(' ');
+  const NOUN = 'badger bear beaver bison crane crow deer dingo dove eagle egret falcon ferret finch fox gecko goat goose hare hawk heron ibis koala lark lemur lion llama lynx magpie marten mink mole moose newt otter owl panda parrot pigeon puffin quail rabbit raven robin salmon seal shrew skunk sloth snail sparrow stoat swan tapir tiger toad trout turtle viper walrus weasel whale wolf wren yak zebra'.split(' ');
+  const randName = () => ADJ[rnd(ADJ.length)] + '-' + NOUN[rnd(NOUN.length)];
+  // one normal form for a name, wherever it comes from: the display form, and its
+  // lowercase as the key names are compared by (so "Alice", "alice " and "ali\u200bce" clash)
+  function normName(s) {
+    if (typeof s !== 'string' || s.length > 256) return null;
+    const d = s.normalize('NFKC').replace(/[\p{Cc}\p{Cf}]/gu, '').replace(/\s+/gu, ' ').trim(), n = [...d].length;
+    return n >= 1 && n <= 24 ? d : null;
+  }
+  const nameKey = d => d.toLowerCase();
+  // p2p:me = { name, rand, secret }. the secret never leaves this browser as is:
+  // each share only ever sees a hash of it mixed with the share's name (shareSecret)
+  function me() {
+    const raw = store.get('p2p:me'), m = raw && typeof raw === 'object' ? raw : {};
+    const out = { name: normName(m.name) || '', rand: normName(m.rand) || randName(), secret: /^[\w-]{43}$/.test(m.secret) ? m.secret : newToken() };
+    if (out.name !== m.name || out.rand !== m.rand || out.secret !== m.secret) store.set('p2p:me', out);
+    return out;
+  }
+  const myName = () => { const m = me(); return m.name || m.rand; };
+  // sha-256 of a short string, as base64url (the js one on plain http, where subtle is missing)
+  const digest = async str => b64u(Uint8Array.from((await sha256(new Blob([str]))).match(/../g), h => parseInt(h, 16)));
+  // what proves who you are to one share's host. per share, so a host can't use it
+  // to pass as you in someone else's share
+  const shareSecret = slug => digest(me().secret + ':' + slug);
+  // a member's public id: the first 12 characters of the hash of its share secret
+  const memberOf = async sec => { const h = await digest(sec); return { id: h.slice(0, 12), secretHash: h }; };
+  const MEMBER = /^[\w-]{12}$/;
+  const RESERVE = 30 * 864e5; // a name stays reserved this long after its member was last seen (as the server keeps share names)
+
   const size = b => b < 1024 ? b + ' B' : b < 1 << 20 ? (b / 1024).toFixed(1) + ' KB' : b < 1 << 30 ? (b / 1048576).toFixed(1) + ' MB' : (b / 1073741824).toFixed(2) + ' GB';
   const pct = (a, b) => (b ? Math.floor(a / b * 100) : 100) + '%';
   const arr = a => Array.isArray(a) ? a : [];
@@ -274,18 +309,21 @@
     return out.sort();
   };
 
-  // indexeddb, keyed [share, path] / [share, note id]
+  // indexeddb, keyed [share, path] / [share, note id] / [share, member id].
+  // upgrades keep what is there: hosts must never lose files to a new version
   const idb = (() => {
     let p;
     const open = () => p || (p = new Promise((res, rej) => {
-      const r = indexedDB.open('p2p', 2);
-      r.onupgradeneeded = () => {
+      const r = indexedDB.open('p2p', 3);
+      r.onupgradeneeded = e => {
         const d = r.result;
-        for (const n of [...d.objectStoreNames]) d.deleteObjectStore(n);
-        d.createObjectStore('files', { keyPath: ['slug', 'path'] });
-        d.createObjectStore('notes', { keyPath: ['slug', 'id'] });
+        if (e.oldVersion < 2) for (const n of [...d.objectStoreNames]) d.deleteObjectStore(n); // (v1 layouts are long gone)
+        if (!d.objectStoreNames.contains('files')) d.createObjectStore('files', { keyPath: ['slug', 'path'] });
+        if (!d.objectStoreNames.contains('notes')) d.createObjectStore('notes', { keyPath: ['slug', 'id'] });
+        if (!d.objectStoreNames.contains('members')) d.createObjectStore('members', { keyPath: ['slug', 'id'] });
       };
-      r.onsuccess = () => res(r.result);
+      // a newer version in another tab needs this one to let go
+      r.onsuccess = () => { r.result.onversionchange = () => { r.result.close(); p = null; }; res(r.result); };
       r.onerror = () => rej(r.error);
     }));
     // signal: aborting it rolls the transaction back, as long as it hasn't committed yet
@@ -314,7 +352,7 @@
         patch: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { const v = q.result && fn(q.result); if (v) o.put(v); }; }),
         delIf: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { if (q.result && fn(q.result)) o.delete([slug, k]); }; }),
         delPrefix: (s, pre) => run(s, 'readwrite', o => o.delete(IDBKeyRange.bound([slug, pre], [slug, pre + '\uffff']))),
-        clear: () => Promise.all(['files', 'notes'].map(s => run(s, 'readwrite', o => o.delete(every)))),
+        clear: () => Promise.all(['files', 'notes', 'members'].map(s => run(s, 'readwrite', o => o.delete(every)))),
       };
     };
   })();
@@ -772,6 +810,13 @@
       }
     }
 
+    // who added something: "you" for your own
+    const who = id => !id ? '?' : id === src.me() ? 'you' : (src.members.get(id) || {}).name || '?';
+    // several owners in a folder: the one with most files there, "+n" for the rest
+    const whos = owners => {
+      const ids = [...owners.keys()].sort((a, b) => owners.get(b) - owners.get(a));
+      return who(ids[0]) + (ids.length > 1 ? ` +${ids.length - 1}` : '');
+    };
     function row(label, meta, acts) {
       return el('li', {}, label, el('span', { class: 'mute meta' }, meta), el('span', { class: 'acts' }, acts));
     }
@@ -784,7 +829,7 @@
       notesEl.replaceChildren(...notes.map(n => {
         const li = row(
           el('button', { class: 'link', 'aria-expanded': String(open.has(n.id)), onclick: () => { open.has(n.id) ? open.delete(n.id) : open.add(n.id); refresh(); } }, n.title),
-          new Date(n.t).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }),
+          `${who(n.author)} · ${new Date(n.t).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}${n.editor ? ` · edited by ${who(n.editor)}` : ''}`,
           [el('button', { onclick: e => copy(n.text, e.target) }, 'copy'), w && el('button', { onclick: () => openNote(n) }, 'edit'), w && el('button', { onclick: e => ask(e.target, 'delete this note?', () => src.unnote(n.id)) }, 'del')],
         );
         if (open.has(n.id)) li.append(el('pre', {}, n.text));
@@ -798,9 +843,10 @@
         if (!f.path.startsWith(pre)) continue;
         const rest = f.path.slice(pre.length), i = rest.indexOf('/');
         if (i < 0) { files.push(f); continue; }
-        const d = dirs.get(rest.slice(0, i)) || { n: 0, size: 0 };
+        const d = dirs.get(rest.slice(0, i)) || { n: 0, size: 0, owners: new Map() };
         d.n++;
         d.size += f.size;
+        d.owners.set(f.owner, (d.owners.get(f.owner) || 0) + 1);
         dirs.set(rest.slice(0, i), d);
       }
       const segs = dir ? dir.split('/') : [];
@@ -810,12 +856,12 @@
       filesEl.replaceChildren(
         ...[...dirs.keys()].sort(byName).map(d => row(
           el('button', { class: 'link', onclick: () => cd(pre + d) }, d + '/'),
-          `${dirs.get(d).n} · ${size(dirs.get(d).size)}`,
+          `${dirs.get(d).n} · ${size(dirs.get(d).size)} · ${whos(dirs.get(d).owners)}`,
           [el('button', { onclick: () => get(pre + d, true) }, 'get'), w && el('button', { onclick: e => ask(e.target, `delete ${d}/ and all inside?`, () => src.rm(pre + d, true)) }, 'del')],
         )),
         ...files.sort((a, b) => byName(a.path, b.path)).map(f => {
           const name = f.path.slice(pre.length);
-          return row(el('span', {}, name), size(f.size),
+          return row(el('span', {}, name), `${size(f.size)} · ${who(f.owner)}`,
             [el('button', { onclick: () => get(f.path) }, 'get'), w && el('button', { onclick: e => ask(e.target, 'delete this file?', () => src.rm(f.path)) }, 'del')]);
         }),
       );
@@ -951,8 +997,26 @@
     draw();
     onTabs = m => { m.t === 'gone' ? live.delete(m.slug) : live.add(m.slug); draw(); };
     if (bc) bc.postMessage({ t: 'who' });
+    // your name: saved as you type; empty means the random one
+    const m0 = me();
+    const nameIn = el('input', { class: 'name', value: m0.name, placeholder: m0.rand, maxlength: '64', autocomplete: 'nickname', spellcheck: 'false', 'aria-label': 'your name' });
+    const asEl = el('p', { class: 'mute' });
+    const showAs = bad => { asEl.textContent = bad ? 'names are 1–24 characters' : `you'll appear as ${myName()}`; };
+    let nameT;
+    nameIn.addEventListener('input', () => {
+      clearTimeout(nameT);
+      nameT = setTimeout(() => {
+        const raw = nameIn.value, n = normName(raw);
+        if (!n && raw.trim()) return showAs(true);
+        store.set('p2p:me', { ...me(), name: n || '' });
+        showAs();
+      }, 250);
+    });
+    showAs();
     app.replaceChildren(...[
       el('h1', {}, 'p2p'),
+      el('section', { class: 'panel' }, el('h2', {}, 'your name'),
+        el('form', { class: 'row', onsubmit: e => e.preventDefault() }, nameIn), asEl),
       el('p', { class: 'mute' }, 'share files, folders and notes straight from your browser to someone else\'s. peer to peer and encrypted. no accounts, nothing stored on a server. a share stays live while your tab is open.'),
       el('section', { class: 'panel' }, el('h2', {}, 'start sharing'),
         el('form', { class: 'row', onsubmit: e => {
@@ -983,10 +1047,46 @@
     if (location.pathname !== '/' + sess.slug) history.replaceState(null, '', '/' + sess.slug);
     current = location.pathname;
     const files = new Map(), notes = new Map(), peers = new Map(), db = idb(sess.slug);
+    // the member registry: { id, secretHash, name, key, lastSeen }. this browser decides
+    // who is who in its share; secrets and their hashes never leave it
+    const members = new Map();
+    const { id: myId, secretHash: mySecret } = await memberOf(await shareSecret(sess.slug));
     try {
-      for (const f of await db.all('files')) files.set(f.path, { path: f.path, size: f.size, mtime: f.mtime, hash: HASH.test(f.hash) ? f.hash : null });
-      for (const n of await db.all('notes')) notes.set(n.id, { id: n.id, title: n.title, text: n.text, t: n.t });
+      for (const m of await db.all('members')) {
+        const name = normName(m.name);
+        if (name && MEMBER.test(m.id) && typeof m.secretHash === 'string') members.set(m.id, { id: m.id, secretHash: m.secretHash, name, key: nameKey(name), lastSeen: +m.lastSeen || 0 });
+      }
+      for (const f of await db.all('files')) files.set(f.path, { path: f.path, size: f.size, mtime: f.mtime, hash: HASH.test(f.hash) ? f.hash : null, owner: MEMBER.test(f.owner) ? f.owner : myId });
+      for (const n of await db.all('notes')) notes.set(n.id, { id: n.id, title: n.title, text: n.text, t: n.t, author: MEMBER.test(n.author) ? n.author : myId, editor: MEMBER.test(n.editor) ? n.editor : null });
     } catch {}
+    const online = id => id === myId || [...peers.values()].some(p => p.member === id);
+    // a name is held while its member is online or was seen in the last 30 days
+    const taken = (key, except) => [...members.values()].some(m => m.id !== except && m.key === key && (online(m.id) || Date.now() - m.lastSeen < RESERVE));
+    // "alice" -> the first free of "alice-2", "alice-3", …
+    const suggest = name => {
+      for (let n = 2; ; n++) {
+        const tail = '-' + n, c = [...name].slice(0, 24 - tail.length).join('') + tail;
+        if (!taken(nameKey(c))) return c;
+      }
+    };
+    const keepMember = m => db.put('members', m).catch(() => {});
+    // members that are long gone and own nothing here: their names are free again
+    for (const m of [...members.values()]) {
+      const owns = [...files.values()].some(f => f.owner === m.id) || [...notes.values()].some(n => n.author === m.id || n.editor === m.id);
+      if (m.id !== myId && !owns && Date.now() - m.lastSeen > RESERVE) { members.delete(m.id); db.del('members', m.id).catch(() => {}); }
+    }
+    // the host is a member too. renaming yourself to a name a guest holds is refused
+    let self = members.get(myId), selfMsg = '';
+    {
+      const want = myName(), key = nameKey(want);
+      if (!self) self = { id: myId, secretHash: mySecret, name: taken(key, myId) ? suggest(want) : want, key: '', lastSeen: 0 };
+      else if (taken(key, myId)) { if (self.key !== key) selfMsg = `"${want}" is taken in this share — you appear as ${self.name}`; }
+      else self.name = want;
+      self.key = nameKey(self.name);
+      self.lastSeen = Date.now();
+      members.set(myId, self);
+      keepMember(self);
+    }
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     const kp = await keypair().catch(() => null);
     if (location.pathname !== '/' + sess.slug) return; // navigated away while loading
@@ -994,20 +1094,30 @@
 
     const persist = () => setHost(sess);
     // v 2: gets take an offset and puts can resume, so guests pick up after a reconnect
-    const ls = () => ({ t: 'ls', v: 2, mode: sess.mode, files: [...files.values()], notes: [...notes.values()] });
+    // what guests may know about members: names and whether they are here. only people
+    // who are online or have something in the share
+    const pub = () => {
+      const used = new Set([myId]);
+      for (const f of files.values()) used.add(f.owner);
+      for (const n of notes.values()) { used.add(n.author); used.add(n.editor); }
+      return [...members.values()].filter(m => used.has(m.id) || online(m.id)).map(m => ({ id: m.id, name: m.name, online: online(m.id), offlineSince: online(m.id) ? 0 : m.lastSeen }));
+    };
+    const ls = () => ({ t: 'ls', v: 3, mode: sess.mode, files: [...files.values()], notes: [...notes.values()], members: pub() });
     let lsTimer;
     const changed = () => {
       clearTimeout(lsTimer);
-      lsTimer = setTimeout(() => { const m = ls(); for (const p of peers.values()) if (p.open) tx(p.dc, m); }, 80);
+      lsTimer = setTimeout(() => { const m = ls(); for (const p of peers.values()) if (p.member) tx(p.dc, m); }, 80);
       v.refresh();
+      showPeople();
     };
     const src = {
-      files, notes,
+      files, notes, members,
+      me: () => myId,
       writable: () => true,
       get: async path => (await db.get('files', path)).blob,
       // hash: when the uploader already worked it out here; guest uploads get hashed by fill()
-      put: async (blob, path, mtime, prog, hash, signal) => {
-        const f = { path, size: blob.size, mtime: Number.isSafeInteger(mtime) ? mtime : Date.now(), hash: HASH.test(hash) ? hash : null };
+      put: async (blob, path, mtime, prog, hash, signal, owner = myId) => {
+        const f = { path, size: blob.size, mtime: Number.isSafeInteger(mtime) ? mtime : Date.now(), hash: HASH.test(hash) ? hash : null, owner };
         await db.put('files', { ...f, blob }, signal);
         // cancelled just as the write committed: take it back out, if nothing replaced it since
         if (signal && signal.aborted) {
@@ -1028,10 +1138,13 @@
         }
         changed();
       },
-      // new note, or an edit when id names an existing one
-      note: async (title, text, id) => {
-        const n = mkNote(title, text, notes.has(id) ? id : null);
-        if (!n || (!notes.has(n.id) && notes.size >= NOTES_MAX)) return;
+      // new note, or an edit when id names an existing one. the author stays;
+      // someone else's edit shows as "edited by"
+      note: async (title, text, id, by = myId) => {
+        const old = notes.get(id), n = mkNote(title, text, old ? id : null);
+        if (!n || (!old && notes.size >= NOTES_MAX)) return;
+        n.author = old ? old.author : by;
+        n.editor = n.author === by ? null : by;
         await db.put('notes', n);
         notes.set(n.id, n);
         changed();
@@ -1100,19 +1213,29 @@
       modeHint.textContent = sess.mode === 'rw' ? 'others can add, edit, download and delete' : 'others can only download and copy';
     };
     showMode();
+    // everyone in the share, host first, then who is here, then who isn't
+    const peopleEl = el('span', {});
+    const showPeople = () => {
+      const list = [...members.values()].filter(m => m.id === myId || online(m.id) || Date.now() - m.lastSeen < RESERVE)
+        .sort((a, b) => (b.id === myId) - (a.id === myId) || online(b.id) - online(a.id) || a.name.localeCompare(b.name));
+      peopleEl.textContent = list.map(m => m.name + (m.id === myId ? ' (host)' : online(m.id) ? '' : ' (offline)')).join(' · ');
+    };
     const showPeers = () => {
-      const open = [...peers.values()].filter(p => p.open), r = open.filter(p => p.dc.relay).length;
+      showPeople();
+      const open = [...peers.values()].filter(p => p.member), r = open.filter(p => p.dc.relay).length;
       state.textContent = live ? `live · ${open.length} connected${r ? ` (${r} relayed)` : ''}` : 'reconnecting…';
     };
 
     const v = panel(src, say, status);
     app.replaceChildren(
       el('div', { class: 'row' }, el('h1', { class: 'grow' }, el('a', { href: '/' }, 'p2p'), ' /' + sess.slug), state),
+      el('p', { class: 'mute' }, `you: ${self.name}`),
       el('section', { class: 'panel' }, el('h2', {}, 'access'),
         el('div', { class: 'kv' },
           el('span', { class: 'mute' }, 'link'), el('span', { class: 'row' }, el('span', { class: 'url' }, link.replace(/^https?:\/\//, '')), el('button', { onclick: e => copy(link, e.target) }, 'copy'), qrBtn),
           el('span', { class: 'mute' }, 'pin'), el('span', { class: 'row' }, el('span', { class: 'grow' }, pinEl), pinBtn, el('button', { onclick: e => copy(sess.pin, e.target) }, 'copy'), el('button', { onclick: regen }, 'new pin')),
           el('span', { class: 'mute' }, 'mode'), el('span', { class: 'row' }, modeBtn, modeHint),
+          el('span', { class: 'mute' }, 'people'), peopleEl,
         ),
         qrBox,
         el('p', { class: 'mute' }, 'send the link and pin to someone. a new pin disconnects everyone. sharing stops when you close this tab and resumes when you reopen it.' +
@@ -1123,6 +1246,8 @@
       el('div', { class: 'row' }, el('span', { class: 'grow' }), el('button', { class: 'link', onclick: e => ask(e.target, 'delete it all & free the name?', end) }, 'stop sharing & delete everything')),
     );
     view = v;
+    showPeople();
+    if (selfMsg) say(selfMsg);
     fill();
 
     let live = false;
@@ -1206,7 +1331,7 @@
         const dc = p.dc = e.channel;
         dc.binaryType = 'arraybuffer';
         dc.bufferedAmountLowThreshold = LOW;
-        dc.onopen = () => { p.open = true; tx(dc, ls()); showPeers(); };
+        dc.onopen = () => { p.open = true; waitHello(p); showPeers(); };
         dc.onclose = () => p.dc === dc && drop(id);
         dc.onmessage = ev => onPeerMsg(p, ev.data).catch(() => {});
         if (dc.readyState === 'open') dc.onopen();
@@ -1243,7 +1368,10 @@
       ch.onmessage = ev => onPeerMsg(p, ev.data).catch(() => {});
       ch.onclose = () => drop(p.id);
       p.open = true;
-      tx(ch, ls());
+      // the guest holds its frames until ours arrive (so nothing overtakes its relay
+      // socket being set up): say something first, then wait for its hello
+      tx(ch, { t: 'hi' });
+      waitHello(p);
       showPeers();
     }
 
@@ -1270,10 +1398,57 @@
       });
     }
 
+    // tabs from before names can't say hello: tell them to reload
+    const OUTDATED = 'this share was updated — reload the page';
+    function outdated(p) {
+      p.outdated = true;
+      tx(p.dc, { t: 'err', e: OUTDATED });
+      setTimeout(() => drop(p.id), 300);
+    }
+    function waitHello(p) {
+      clearTimeout(p.helloT);
+      p.helloT = setTimeout(() => peers.get(p.id) === p && !p.member && outdated(p), 3000);
+    }
+    // hellos are handled one at a time, so two people can't take one name at once
+    let helloQ = Promise.resolve();
+    function hello(p, m) {
+      if (p.member || p.hello || p.outdated) return;
+      if (!(m.v >= 3)) return outdated(p);
+      const name = normName(m.name), sec = typeof m.secret === 'string' && /^[\w-]{43}$/.test(m.secret) ? m.secret : null;
+      if (!name || !sec) return outdated(p);
+      p.hello = true;
+      clearTimeout(p.helloT);
+      helloQ = helloQ.then(async () => {
+        const { id, secretHash } = await memberOf(sec), key = nameKey(name);
+        if (peers.get(p.id) !== p) return;
+        let mb = members.get(id);
+        if (mb && mb.secretHash !== secretHash) return outdated(p); // (a 72-bit id clash: never in practice)
+        if (id === myId) return outdated(p); // this browser is the host
+        if (mb) {
+          // known member: a new name is taken on if it's free, else the old one stays
+          if (mb.key !== key && !taken(key, id)) { mb.name = name; mb.key = key; }
+        } else if (taken(key)) {
+          p.hello = false;
+          waitHello(p);
+          return tx(p.dc, { t: 'name-taken', suggest: suggest(name) });
+        } else members.set(id, mb = { id, secretHash, name, key, lastSeen: 0 });
+        mb.lastSeen = Date.now();
+        keepMember(mb);
+        p.member = id;
+        tx(p.dc, { ...ls(), t: 'welcome', you: { id, name: mb.name } });
+        changed();
+        showPeers();
+      }).catch(() => {});
+    }
+
     function drop(id) {
       const p = peers.get(id);
       if (!p) return;
       peers.delete(id);
+      clearTimeout(p.helloT);
+      // last tab of that member gone: remember when it was last here
+      const mb = p.member && members.get(p.member);
+      if (mb && !online(mb.id)) { mb.lastSeen = Date.now(); keepMember(mb); changed(); }
       for (const u of p.ups.values()) park(u);
       p.ups.clear();
       p.saving.clear(); // stored anyway: the guest can't cancel any more, and finds it there when it resumes
@@ -1322,6 +1497,8 @@
       }
       const m = rx(p.rx, data);
       if (!m) return;
+      if (m.t === 'hello') return hello(p, m);
+      if (!p.member) return; // nothing else before we know who this is
       const req = m.req >>> 0, rw = sess.mode === 'rw';
       const fail = e => tx(p.dc, { t: 'err', req, e });
       switch (m.t) {
@@ -1395,7 +1572,7 @@
           p.saving.set(req, u);
           serve();
           // a guest that reconnects while this is being stored waits for the same result
-          u.saving = src.put(new Blob(u.parts), u.path, u.mtime, null, null, u.ctl.signal).then(() => true, () => u.ctl.signal.aborted ? null : false);
+          u.saving = src.put(new Blob(u.parts), u.path, u.mtime, null, null, u.ctl.signal, p.member).then(() => true, () => u.ctl.signal.aborted ? null : false);
           const ok = await u.saving;
           if (p.saving.get(req) === u) p.saving.delete(req);
           forget(u);
@@ -1411,7 +1588,7 @@
           if (path) await src.rm(path, m.dir === true);
           return;
         }
-        case 'note': return rw ? src.note(m.title, m.text, typeof m.id === 'string' ? m.id : null) : fail('read-only share');
+        case 'note': return rw ? src.note(m.title, m.text, typeof m.id === 'string' ? m.id : null, p.member) : fail('read-only share');
         case 'unnote': return !rw ? fail('read-only share') : notes.has(m.id) && src.unnote(m.id);
       }
     }
@@ -1445,11 +1622,17 @@
   function guest(slug) {
     document.title = slug + ' · p2p';
     const key = 'p2p:g:' + slug;
-    const files = new Map(), notes = new Map(), pend = new Map();
+    const files = new Map(), notes = new Map(), members = new Map(), pend = new Map();
     // transfers outlive a dropped connection and carry on from where they got to on the
     // next one; notes and deletes made meanwhile wait in the outbox
     const xfers = new Set(), outbox = [];
-    let pin = store.get(key), mode = 'ro', sig = null, pc = null, dc = null, rxs = {}, n = 0, timer = null, v = null;
+    // p2p:g:<slug> = { pin, name } (name: only when it differs from your usual one).
+    // older versions stored just the pin
+    const kept = store.get(key);
+    let pin = typeof kept === 'string' ? kept : kept && typeof kept.pin === 'string' ? kept.pin : null;
+    let myname = (kept && normName(kept.name)) || myName(), myId = null, secret = null;
+    const remember = () => store.set(key, myname === myName() ? { pin } : { pin, name: myname });
+    let mode = 'ro', sig = null, pc = null, dc = null, rxs = {}, n = 0, timer = null, v = null;
     let ready = false, retrying = false, hostV = 0, relayed = false;
     const unhold = hold();
 
@@ -1494,6 +1677,8 @@
     }
 
     async function start() {
+      secret = await shareSecret(slug).catch(() => null);
+      if (cleanup !== quit) return; // navigated away
       if (pin) return connect();
       app.replaceChildren(head, status);
       const s = await peek(slug);
@@ -1502,26 +1687,33 @@
       form(s.live ? '' : `the owner of /${slug} is offline right now. you can still enter the pin; you'll connect when they're back.`);
     }
 
-    function form(msg) {
+    // keepPin: back here only to pick another name, so the pin is still good
+    function form(msg, suggest, keepPin) {
       teardown();
       view = v = null;
       dropTo = pasteTo = null;
       state.textContent = '';
-      const input = el('input', { class: 'big', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '7', placeholder: '•••••••', 'aria-label': 'pin' });
+      const input = el('input', { class: 'big', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '7', placeholder: '•••••••', 'aria-label': 'pin', value: keepPin && pin || '' });
+      // people who open a link never see the home page: this is where they pick a name
+      const nameIn = el('input', { class: 'name', value: suggest || myname, placeholder: me().rand, maxlength: '64', autocomplete: 'nickname', spellcheck: 'false', 'aria-label': 'your name' });
       const submit = () => {
         const val = input.value.replace(/\D/g, '');
+        const nm = nameIn.value.trim() ? normName(nameIn.value) : me().rand;
+        if (!nm) return say('names are 1–24 characters');
         if (val.length !== 7) return say('the pin has 7 digits');
         pin = val;
+        myname = nm;
         connect();
       };
-      input.addEventListener('input', () => { input.value = input.value.replace(/\D/g, '').slice(0, 7); if (input.value.length === 7) submit(); });
+      input.addEventListener('input', () => { input.value = input.value.replace(/\D/g, '').slice(0, 7); if (input.value.length === 7 && !suggest) submit(); });
       app.replaceChildren(head,
         el('section', { class: 'panel' }, el('h2', {}, 'enter pin'),
-          el('form', { class: 'row', onsubmit: e => { e.preventDefault(); submit(); } }, input, el('button', { type: 'submit' }, 'open')),
+          el('form', { class: 'row', onsubmit: e => { e.preventDefault(); submit(); } },
+            el('div', { class: 'row grow' }, el('span', { class: 'mute' }, 'name'), nameIn), input, el('button', { type: 'submit' }, 'open')),
           el('p', { class: 'mute' }, 'ask the person sharing /' + slug + ' for their 7-digit pin.')),
         status);
       say(msg || '');
-      input.focus();
+      (suggest ? nameIn : input).focus();
     }
 
     function wait(msg, ms) {
@@ -1594,9 +1786,8 @@
         opened = true;
         relayed = false;
         clearTimeout(timer);
-        store.set(key, pin);
         if (sig) { sig.close(); sig = null; } // direct from here on
-        show();
+        hello();
       };
       ch.onclose = lost;
       ch.onmessage = e => onMsg(e.data);
@@ -1625,10 +1816,14 @@
       };
       s.send({ t: 'sig', data: { relay: 1 } });
       clearTimeout(timer);
-      store.set(key, pin);
-      show();
+      hello();
     }
 
+    // first thing on every connection: who we are. only over the encrypted channel,
+    // never through the server. the host answers welcome or name-taken
+    function hello() {
+      tx(dc, { t: 'hello', v: 3, name: myname, secret, have: [] });
+    }
     function onMsg(data) {
       if (typeof data !== 'string') {
         if (data.byteLength < 4) return;
@@ -1643,18 +1838,35 @@
       if (!m) return;
       const x = pend.get(m.req);
       switch (m.t) {
+        case 'name-taken': {
+          const taken = myname, sug = normName(m.suggest);
+          return form(`"${taken}" is taken in this share — pick another name`, sug || '', true);
+        }
+        case 'welcome':
+          if (!m.you || !MEMBER.test(m.you.id)) return;
+          myId = m.you.id;
+          myname = normName(m.you.name) || myname;
+          remember();
+          show();
+          // falls through: the rest is a listing
         case 'ls':
+          members.clear();
+          for (const x of arr(m.members)) {
+            const nm = x && normName(x.name);
+            if (nm && MEMBER.test(x.id)) members.set(x.id, { id: x.id, name: nm, online: !!x.online, offlineSince: +x.offlineSince || 0 });
+          }
           mode = m.mode === 'rw' ? 'rw' : 'ro';
           files.clear();
           for (const f of arr(m.files)) {
             const path = f && clean(f.path);
-            if (path && Number.isSafeInteger(f.size) && f.size >= 0) files.set(path, { path, size: f.size, mtime: +f.mtime || 0, hash: HASH.test(f.hash) ? f.hash : null });
+            if (path && Number.isSafeInteger(f.size) && f.size >= 0) files.set(path, { path, size: f.size, mtime: +f.mtime || 0, hash: HASH.test(f.hash) ? f.hash : null, owner: MEMBER.test(f.owner) ? f.owner : null });
           }
           notes.clear();
           for (const x of arr(m.notes)) {
-            if (x && typeof x.id === 'string' && typeof x.title === 'string' && typeof x.text === 'string' && x.text.length <= NOTE_MAX) notes.set(x.id, { id: x.id, title: x.title.slice(0, TITLE_MAX), text: x.text, t: +x.t || 0 });
+            if (x && typeof x.id === 'string' && typeof x.title === 'string' && typeof x.text === 'string' && x.text.length <= NOTE_MAX) notes.set(x.id, { id: x.id, title: x.title.slice(0, TITLE_MAX), text: x.text, t: +x.t || 0, author: MEMBER.test(x.author) ? x.author : null, editor: MEMBER.test(x.editor) ? x.editor : null });
           }
-          state.textContent = 'connected · ' + (mode === 'rw' ? 'two-way' : 'one-way') + (dc && dc.relay ? ' · relayed' : '');
+          if (!myId) return; // a listing before welcome: not ours to show yet
+          state.textContent = `connected as ${myname} · ` + (mode === 'rw' ? 'two-way' : 'one-way') + (dc && dc.relay ? ' · relayed' : '');
           if (!ready) {
             // first listing on this connection: carry on with whatever was going before
             ready = true;
@@ -1748,7 +1960,8 @@
     }
 
     const src = {
-      files, notes,
+      files, notes, members,
+      me: () => myId,
       writable: () => mode === 'rw',
       get: (path, prog, signal) => {
         const f = files.get(path) || {};
