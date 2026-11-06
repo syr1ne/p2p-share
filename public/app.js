@@ -96,11 +96,17 @@
   // sha-256 in plain js: crypto.subtle is missing on plain-http pages, and this
   // reads big files in slices instead of loading them whole into memory
   const K256 = Uint32Array.from('428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 d807aa98 12835b01 243185be 550c7dc3 72be5d74 80deb1fe 9bdc06a7 c19bf174 e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da 983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 27b70a85 2e1b2138 4d2c6dfc 53380d13 650a7354 766a0abb 81c2c92e 92722c85 a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070 19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 748f82ee 78a5636f 84c87814 8cc70208 90befffa a4506ceb bef9a3f7 c67178f2'.split(' '), h => parseInt(h, 16));
-  async function sha256(blob, prog) {
+  // signal: stops between slices (and around the native digest, which can't be interrupted)
+  async function sha256(blob, prog, signal) {
+    const stop = () => { if (signal && signal.aborted) throw signal.reason; };
+    stop();
     // native when available and the file fits comfortably in memory (less of it on
     // phones): many times faster, and keeps the main thread free for transfers
     if (subtle && blob.size <= (coarse() ? 64 : 256) << 20) {
-      const d = new Uint8Array(await subtle.digest('SHA-256', await blob.arrayBuffer()));
+      const buf = await blob.arrayBuffer();
+      stop();
+      const d = new Uint8Array(await subtle.digest('SHA-256', buf));
+      stop();
       if (prog) prog(blob.size);
       return [...d].map(x => x.toString(16).padStart(2, '0')).join('');
     }
@@ -124,8 +130,11 @@
     let o = 0;
     for (let left; (left = blob.size - o) >= 64; o += left) {
       left = Math.min(4 << 20, left - left % 64);
-      blocks(new Uint8Array(await blob.slice(o, o + left).arrayBuffer()));
+      const u = new Uint8Array(await blob.slice(o, o + left).arrayBuffer());
+      stop();
+      blocks(u);
       if (prog) await prog(o + left); // may hold the hashing up for a while
+      stop();
     }
     // last partial block, then 0x80, zeros and the length in bits
     const tail = new Uint8Array(await blob.slice(o).arrayBuffer()), pad = new Uint8Array(tail.length < 56 ? 64 : 128), v = new DataView(pad.buffer);
@@ -279,13 +288,18 @@
       r.onsuccess = () => res(r.result);
       r.onerror = () => rej(r.error);
     }));
-    const run = async (name, mode, fn) => {
+    // signal: aborting it rolls the transaction back, as long as it hasn't committed yet
+    const run = async (name, mode, fn, signal) => {
       const d = await open();
       return new Promise((res, rej) => {
+        if (signal && signal.aborted) return rej(signal.reason);
         const t = d.transaction(name, mode);
         const q = fn(t.objectStore(name));
-        t.oncomplete = () => res(q && q.result);
-        t.onerror = t.onabort = () => rej(t.error || new Error('storage error'));
+        const off = () => { try { t.abort(); } catch {} };
+        if (signal) signal.addEventListener('abort', off, { once: true });
+        const done = () => signal && signal.removeEventListener('abort', off);
+        t.oncomplete = () => { done(); res(q && q.result); };
+        t.onerror = t.onabort = () => { done(); rej(signal && signal.aborted ? signal.reason : t.error || new Error('storage error')); };
       });
     };
     // one share's view of the stores
@@ -294,10 +308,11 @@
       return {
         all: s => run(s, 'readonly', o => o.getAll(every)),
         get: (s, k) => run(s, 'readonly', o => o.get([slug, k])),
-        put: (s, v) => run(s, 'readwrite', o => o.put({ ...v, slug })),
+        put: (s, v, signal) => run(s, 'readwrite', o => o.put({ ...v, slug }), signal),
         del: (s, k) => run(s, 'readwrite', o => o.delete([slug, k])),
         // read, check and write in one transaction, so a newer put can't be overwritten
         patch: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { const v = q.result && fn(q.result); if (v) o.put(v); }; }),
+        delIf: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { if (q.result && fn(q.result)) o.delete([slug, k]); }; }),
         delPrefix: (s, pre) => run(s, 'readwrite', o => o.delete(IDBKeyRange.bound([slug, pre], [slug, pre + '\uffff']))),
         clear: () => Promise.all(['files', 'notes'].map(s => run(s, 'readwrite', o => o.delete(every)))),
       };
@@ -649,41 +664,66 @@
     const sure = q => new Promise(r => ask(cancelBtn, q, () => r(true), () => r(false)));
     const short = s => `"${s.length > 40 ? s.slice(0, 18) + '…' + s.slice(-18) : s}"`;
     async function send(items, base, ctl) {
-      const sig = ctl.signal;
+      const sig = ctl.signal, inflight = new Set();
       let done = 0, skipped = 0;
       try {
         if (sig.aborted) throw sig.reason;
+        // same name as a file already in this folder? ask first; if allowed, those
+        // are uploaded without the content check below
+        const named = new Set(items.filter(([, rel]) => src.files.has(clean(base + rel))));
+        if (named.size) {
+          if (sig.aborted) throw sig.reason;
+          const [[, rel]] = named;
+          status('');
+          const ok = await sure(named.size > 1 ? `${named.size} files with these names already exist. upload them anyway?`
+            : `${short(rel)} already exists. upload anyway?`);
+          if (sig.aborted) throw sig.reason;
+          if (!ok) { skipped = named.size; items = items.filter(it => !named.has(it)); named.clear(); }
+        }
         // same content as a file already here, or earlier in this batch? only files
         // whose size matches another one get hashed, so most uploads skip this
         const have = new Map(), sizes = new Map(), dups = new Map();
         for (const f of src.files.values()) if (f.hash) { have.set(f.hash, [f.path, false]); sizes.set(f.size, 1); }
-        for (const [f] of items) sizes.set(f.size, (sizes.get(f.size) || 0) + 1);
+        for (const it of items) if (!named.has(it)) sizes.set(it[0].size, (sizes.get(it[0].size) || 0) + 1);
         for (const it of items) {
           const [f, rel] = it;
-          if (sizes.get(f.size) < 2) continue;
-          it.hash = await sha256(f, b => status(`checking ${rel} ${pct(b, f.size)}`));
+          if (named.has(it) || sizes.get(f.size) < 2) continue;
+          it.hash = await sha256(f, b => !sig.aborted && status(`checking ${rel} ${pct(b, f.size)}`), sig);
+          if (sig.aborted) throw sig.reason;
           if (have.has(it.hash)) dups.set(it, have.get(it.hash));
           else have.set(it.hash, [clean(base + rel), true]);
         }
+        if (sig.aborted) throw sig.reason; // never ask after a cancel
         if (dups.size) {
           const [[[, rel], [at, batch]]] = dups, same = at === clean(base + rel);
           status('');
           const ok = await sure(dups.size > 1 ? `${dups.size} of these files already exist. upload them anyway?`
             : batch ? `${short(rel)} is the same file as ${short(at)}. upload both?`
             : `${short(rel)} already exists${same ? '' : ' as ' + short(at)}. upload anyway?`);
-          if (!ok) { skipped = dups.size; items = items.filter(it => !dups.has(it)); }
+          if (sig.aborted) throw sig.reason;
+          if (!ok) { skipped += dups.size; items = items.filter(it => !dups.has(it)); }
         }
         if (sig.aborted) throw sig.reason;
         items = items.filter(([, rel]) => clean(base + rel));
         const total = items.reduce((s, [f]) => s + f.size, 0);
-        let sent = 0;
+        let sent = 0, saving = 0;
         const show = meter(total, () => items.length === 1 ? `↑ ${items[0][1]}` : `↑ ${done}/${items.length}`);
         // a few at once, so small files don't each wait out a round trip
         await pool(items, 3, async it => {
           const [f, rel] = it;
-          let last = 0;
-          const step = b => { sent += b - last; last = b; show(sent); };
-          await src.put(f, clean(base + rel), f.lastModified, step, it.hash, sig);
+          let last = 0, mine = false;
+          // all bytes out and the host is storing them: say so instead of a frozen 100%
+          const step = (b, stored) => {
+            if (stored && !mine) { mine = true; saving++; }
+            sent += b - last;
+            last = b;
+            if (sig.aborted) return;
+            if (saving && saving === items.length - done) status('saving on host…');
+            else show(sent);
+          };
+          const put = src.put(f, clean(base + rel), f.lastModified, step, it.hash, sig);
+          inflight.add(put);
+          try { await put; } finally { if (mine) saving--; }
           done++;
           step(f.size);
         }, sig);
@@ -691,7 +731,11 @@
       } catch (e) {
         const stopped = sig.aborted;
         ctl.abort(); // a failed file stops the rest of its batch
-        stopped ? status(`↑ cancelled${done ? ` · ${done} file${done === 1 ? '' : 's'} added` : ''}`) : fail(e);
+        if (!stopped) return fail(e);
+        // a file the host was already storing may still report back: either way, say which
+        const late = (await Promise.allSettled(inflight)).filter(r => r.status === 'rejected' && r.reason && r.reason.saved).length;
+        done += late;
+        status(late && late === done ? `↑ already saved${done > 1 ? ` · ${done} files` : ''}` : `↑ cancelled${done ? ` · ${done} file${done === 1 ? '' : 's'} added` : ''}`);
       }
     }
     async function get(path, isDir) {
@@ -962,9 +1006,14 @@
       writable: () => true,
       get: async path => (await db.get('files', path)).blob,
       // hash: when the uploader already worked it out here; guest uploads get hashed by fill()
-      put: async (blob, path, mtime, prog, hash) => {
+      put: async (blob, path, mtime, prog, hash, signal) => {
         const f = { path, size: blob.size, mtime: Number.isSafeInteger(mtime) ? mtime : Date.now(), hash: HASH.test(hash) ? hash : null };
-        await db.put('files', { ...f, blob });
+        await db.put('files', { ...f, blob }, signal);
+        // cancelled just as the write committed: take it back out, if nothing replaced it since
+        if (signal && signal.aborted) {
+          await db.delIf('files', path, r => r.size === f.size && r.mtime === f.mtime && (r.hash || null) === f.hash).catch(() => {});
+          throw signal.reason;
+        }
         files.set(path, f);
         changed();
         if (!f.hash) fill();
@@ -1148,7 +1197,8 @@
 
     function addPeer(id) {
       const pc = new RTCPeerConnection({ iceServers: sig.ice });
-      const p = { id, pc, dc: null, open: false, q: Promise.resolve(), ups: new Map(), stop: new Set(), rx: {} };
+      // ups: uploads arriving, saving: uploads being stored, stop: cancelled downloads (all by req)
+      const p = { id, pc, dc: null, open: false, q: Promise.resolve(), ups: new Map(), saving: new Map(), stop: new Set(), rx: {} };
       pc.onicecandidate = e => e.candidate && sig.send({ t: 'sig', to: id, data: { c: e.candidate } });
       pc.onconnectionstatechange = () => p.pc === pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed') && drop(id);
       pc.ondatachannel = e => {
@@ -1226,6 +1276,7 @@
       peers.delete(id);
       for (const u of p.ups.values()) park(u);
       p.ups.clear();
+      p.saving.clear(); // stored anyway: the guest can't cancel any more, and finds it there when it resumes
       try { p.pc.close(); } catch {}
       showPeers();
       serve();
@@ -1255,7 +1306,8 @@
       }
       partial.set(u.id, u);
     }
-    const saved = (p, req, ok) => tx(p.dc, ok ? { t: 'ok', req } : { t: 'err', req, e: 'host is out of storage' });
+    // ok: true stored, false failed, null cancelled while storing
+    const saved = (p, req, ok) => tx(p.dc, ok ? { t: 'ok', req } : { t: 'err', req, e: ok === null ? 'cancelled' : 'host is out of storage' });
 
     // everything a guest sends is untrusted
     async function onPeerMsg(p, data) {
@@ -1293,9 +1345,15 @@
           }
           return;
         }
+        // uploads and downloads are cancelled separately (up: true / false), so one can
+        // never stop the other. guests from before this don't say: try uploads first
         case 'cancel': {
-          const u = p.ups.get(req);
-          if (u) return forget(u);
+          if (m.up !== false) {
+            const u = p.ups.get(req), s = p.saving.get(req);
+            if (u) return forget(u);
+            if (s) return s.ctl.abort(); // rolls back the write; 'end' below answers
+            if (m.up === true) return;
+          }
           if (p.stop.size < 64) p.stop.add(req);
           return;
         }
@@ -1332,10 +1390,14 @@
           if (!u) return;
           if (u.got !== u.size) { forget(u); return fail('upload incomplete'); }
           p.ups.delete(req);
+          // still addressable while it is stored, so a cancel now undoes it
+          u.ctl = new AbortController();
+          p.saving.set(req, u);
           serve();
           // a guest that reconnects while this is being stored waits for the same result
-          u.saving = src.put(new Blob(u.parts), u.path, u.mtime).then(() => true, () => false);
+          u.saving = src.put(new Blob(u.parts), u.path, u.mtime, null, null, u.ctl.signal).then(() => true, () => u.ctl.signal.aborted ? null : false);
           const ok = await u.saving;
+          if (p.saving.get(req) === u) p.saving.delete(req);
           forget(u);
           if (ok && u.id) {
             stored.add(u.id);
@@ -1603,9 +1665,11 @@
           return v && v.refresh();
         case 'at': if (x && x.up && Number.isSafeInteger(m.off) && m.off >= 0 && m.off <= x.blob.size) pump(x, m.off); return;
         case 'end': if (x && !x.up) finish(x, null, new Blob(x.parts)); return;
-        case 'ok': if (x && x.up) finish(x); return;
+        // cancelled while the host was storing it: its answer says which won
+        case 'ok': if (x && x.up) finish(x, x.reason && Object.assign(new Error('already saved'), { saved: true })); return;
         case 'err':
-          if (x) finish(x, new Error(String(m.e).slice(0, 100))); else say('error: ' + String(m.e).slice(0, 100));
+          if (x) finish(x, x.reason || new Error(String(m.e).slice(0, 100)));
+          else if (m.req == null) say('error: ' + String(m.e).slice(0, 100)); // replies to cancelled requests are expected
           return;
         case 'bye':
           store.del(key);
@@ -1614,6 +1678,7 @@
     }
 
     function finish(x, err, val) {
+      clearTimeout(x.wait);
       if (!xfers.delete(x)) return;
       if (pend.get(x.req) === x) pend.delete(x.req);
       err ? x.rej(err) : x.res(val);
@@ -1625,7 +1690,15 @@
         x.rej = rej;
         xfers.add(x);
         if (signal) signal.addEventListener('abort', () => {
-          if (xfers.has(x) && pend.get(x.req) === x) tx(dc, { t: 'cancel', req: x.req });
+          const live = xfers.has(x) && pend.get(x.req) === x;
+          if (live) tx(dc, { t: 'cancel', req: x.req, up: !!x.up });
+          // all sent: the host may be storing it already. wait (a little) for it to
+          // say whether the cancel stopped that or came too late
+          if (live && x.up && x.ended) {
+            x.reason = signal.reason;
+            x.wait = setTimeout(() => finish(x, signal.reason), 5000);
+            return;
+          }
           finish(x, signal.reason);
         }, { once: true });
         begin(x);
@@ -1633,6 +1706,7 @@
     }
     // (re)start a transfer on the current connection, from where it got to
     function begin(x) {
+      if (x.reason) return finish(x, x.reason); // cancelled while the host was storing it; the connection went first
       if (!ready || !dc || dc.readyState !== 'open') return; // the next connection starts it
       const req = x.req = ++n;
       pend.set(req, x);
@@ -1644,14 +1718,25 @@
       // the host to say how much it already has ('at')
       const resume = x.sent && hostV >= 2;
       x.sent = true;
+      x.ended = false;
       tx(dc, { t: 'put', req, path: x.path, size: x.blob.size, mtime: x.mtime, id: x.id, resume });
       if (!resume) pump(x, 0);
     }
     function pump(x, off) {
       const c = dc, req = x.req;
-      stream(pc, c, req, x.blob, x.prog, () => x.req !== req || !xfers.has(x), off).then(all => all && tx(c, { t: 'end', req }), e => {
+      stream(pc, c, req, x.blob, x.prog, () => x.req !== req || !xfers.has(x), off).then(async all => {
+        if (!all) return;
+        tx(c, { t: 'end', req });
+        x.ended = true;
+        // once the last byte has left, the host is storing it
+        while (c.readyState === 'open' && c.bufferedAmount > 0 && x.req === req && xfers.has(x)) {
+          if (x.prog) x.prog(x.blob.size - c.bufferedAmount);
+          await new Promise(r => setTimeout(r, 50));
+        }
+        if (x.req === req && xfers.has(x) && x.prog) x.prog(x.blob.size, true);
+      }, e => {
         if (c.readyState !== 'open' || x.req !== req) return; // connection dropped: begin() picks it up again
-        tx(c, { t: 'cancel', req }); // the file itself can't be read (moved, changed)
+        tx(c, { t: 'cancel', req, up: true }); // the file itself can't be read (moved, changed)
         finish(x, e);
       });
     }
