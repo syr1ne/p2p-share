@@ -30,7 +30,9 @@ const RESERVED = new Set(['ws', 'api', 'app', 'admin', 'static', 'assets', 'inde
 // ---- static ---------------------------------------------------------------
 
 const PUB = path.join(__dirname, 'public');
-const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
+// worker-src, frame-src and the one trusted types policy: public/sw.js streams downloads to
+// disk, started from a hidden same-origin frame
+const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; worker-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types p2p-sw";
 const SEC = {
   'Content-Security-Policy': CSP,
   'X-Content-Type-Options': 'nosniff',
@@ -47,7 +49,7 @@ const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; ch
 // (so editing the app needs no restart)
 const assets = {};
 function load() {
-  for (const f of ['index.html', 'app.js', 'qr.js', 'style.css', 'robots.txt']) {
+  for (const f of ['index.html', 'app.js', 'qr.js', 'sw.js', 'style.css', 'robots.txt']) {
     const file = path.join(PUB, f);
     if (!fs.existsSync(file)) { delete assets['/' + f]; continue; }
     const body = fs.readFileSync(file);

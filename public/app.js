@@ -15,7 +15,6 @@
   // links between guests: at most LINKS_MAX each, closed after LINK_IDLE unused; a link
   // not open after DIRECT_WAIT goes through the host instead. SERVES_MAX files served at once
   const LINKS_MAX = 8, LINK_IDLE = 2 * 6e4, DIRECT_WAIT = 6000, SERVES_MAX = 4;
-  const ZIP_MAX = 0xffffffff; // no zip64: 4 GB per folder download
   const app = document.getElementById('app');
 
   // ---- utils --------------------------------------------------------------
@@ -366,6 +365,7 @@
         all: s => run(s, 'readonly', o => o.getAll(every)),
         get: (s, k) => run(s, 'readonly', o => o.get([slug, k])),
         put: (s, v, signal) => run(s, 'readwrite', o => o.put({ ...v, slug }), signal),
+        putAll: (s, vs, signal) => run(s, 'readwrite', o => { for (const v of vs) o.put({ ...v, slug }); }, signal),
         del: (s, k) => run(s, 'readwrite', o => o.delete([slug, k])),
         // read, check and write in one transaction, so a newer put can't be overwritten
         patch: (s, k, fn) => run(s, 'readwrite', o => { const q = o.get([slug, k]); q.onsuccess = () => { const v = q.result && fn(q.result); if (v) o.put(v); }; }),
@@ -415,8 +415,20 @@
   function tx(dc, m) {
     if (!dc || dc.readyState !== 'open') return;
     const s = JSON.stringify(m);
-    if (s.length <= PART) return dc.send(s);
-    for (let i = 0; i < s.length; i += PART) dc.send(JSON.stringify({ t: '+', d: s.slice(i, i + PART), end: i + PART >= s.length }));
+    if (s.length <= PART && !dc.txn) return dc.send(s);
+    // a big one (a listing of thousands of files) waits for room between parts, so the
+    // channel's buffer never overflows; whatever is sent meanwhile queues behind it
+    const parts = [];
+    if (s.length <= PART) parts.push(s);
+    else for (let i = 0; i < s.length; i += PART) parts.push(JSON.stringify({ t: '+', d: s.slice(i, i + PART), end: i + PART >= s.length }));
+    dc.txn = (dc.txn || 0) + 1;
+    dc.txq = (dc.txq || Promise.resolve()).then(async () => {
+      for (const p of parts) {
+        if (dc.readyState !== 'open') return;
+        if (dc.bufferedAmount > LOW) await drain(dc);
+        dc.send(p);
+      }
+    }).catch(() => {}).finally(() => { if (!--dc.txn) dc.txq = null; });
   }
   function rx(st, raw) {
     if (typeof raw !== 'string') return null;
@@ -715,7 +727,8 @@
   }
   function fill(a) {
     const x = a.x;
-    while (a.wins.length < INFLIGHT && a.next < x.size) {
+    // a sink that's behind (a slow disk, a download the browser reads slowly) holds new wants back
+    while (a.wins.length < INFLIGHT && a.next < x.size && !(x.sink.full && x.sink.full())) {
       const len = Math.min(WIN, x.size - a.next);
       a.wins.push({ at: a.next, end: a.next + len });
       a.c.send({ t: 'want', xid: a.xid, off: a.next, len });
@@ -741,7 +754,7 @@
     const x = a.x, w = a.wins[0], n = buf.byteLength - HDR;
     if (x.att !== a) return;
     if (!a.meta || !w || off !== w.at || off + n > w.end) return attemptFailed(a, 'bad data from the other side', true);
-    x.sink.write(new Uint8Array(buf, HDR), off);
+    try { x.sink.write(new Uint8Array(buf, HDR), off); } catch (e) { return attemptFailed(a, (e && e.message) || 'could not save', true); }
     w.at += n;
     x.got = w.at;
     c.used = Date.now();
@@ -770,64 +783,267 @@
     if (a && a.c.pulls.get(a.xid) === a) { a.c.pulls.delete(a.xid); a.c.send({ t: 'close', xid: a.xid }); }
   }
 
-  // where downloaded bytes go: memory for now (blob parts, folded into a blob
-  // every 16 MB so the browser can page them out)
+  // ---- where downloads go -------------------------------------------------
+  // a sink takes a download's bytes: { write(u8, off), full(), onroom, close(), abort() }.
+  // full() says to stop asking the other side for more; onroom() is called when there's
+  // room again, so a slow disk or stream sets the pace all the way back to the owner.
+  // in order of preference:
+  //   fs   file system access (chromium): written in place, any size, folders as folders
+  //   sw   a download streamed through public/sw.js (needs https): any size, folders as zip64
+  //   mem  in memory, then saved (plain http, or nothing else works): size-limited by ram
+
+  // in memory: blob parts, folded into a blob every 16 MB so the browser can page them out
   function memSink() {
     const t = { parts: [], mem: 0 };
     return {
+      kind: 'mem',
       write: u8 => collect(t, u8),
       whole: b => { t.parts = [b]; },
       blob: () => new Blob(t.parts),
+      close: async () => {},
+      abort: async () => { t.parts = []; },
     };
   }
 
-  // ---- zip (store only) for folder downloads ------------------------------
+  // file system access: positional writes into a swap file the browser only puts in
+  // place on close(); abort() throws it away and removes the (empty) file the picker made
+  async function fsSink(handle) {
+    const w = await handle.createWritable();
+    let q = Promise.resolve(), pend = 0, err = null;
+    const s = {
+      kind: 'fs', onroom: null,
+      write(u8, off) {
+        if (err) throw err;
+        const n = u8.length;
+        pend += n;
+        q = q.then(() => w.write({ type: 'write', position: off, data: u8 })).then(() => { pend -= n; if (s.onroom) s.onroom(); }, e => { err = err || e; if (s.onroom) s.onroom(); });
+      },
+      // once broken, never "full": the next write then throws, and the download fails instead of waiting
+      full: () => !err && pend >= 4 * WIN,
+      close: async () => { await q; if (err) throw err; await w.close(); },
+      abort: async () => { err = err || new Error('cancelled'); await q; await w.abort().catch(() => {}); if (handle.remove) await handle.remove().catch(() => {}); },
+    };
+    return s;
+  }
+  // names that are fine here may not be on someone's disk
+  const diskName = s => s.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').replace(/[. ]+$/, '_') || '_';
+  // "photo.jpg" → "photo (2).jpg"
+  const nth = (name, k) => { const d = name.lastIndexOf('.'); return d > 0 ? `${name.slice(0, d)} (${k})${name.slice(d)}` : `${name} (${k})`; };
+  const exists = async (dir, name) => {
+    for (const kind of ['getFileHandle', 'getDirectoryHandle']) { try { await dir[kind](name); return true; } catch {} }
+    return false;
+  };
+  // a folder written as real files and folders inside the one picked. nothing that is
+  // already there gets overwritten: a clash gets " (2)"
+  async function fsDir(root, top) {
+    let name = diskName(top);
+    for (let k = 2; await exists(root, name); k++) name = nth(diskName(top), k);
+    const base = await root.getDirectoryHandle(name, { create: true }), dirs = new Map([['', base]]);
+    const dirOf = path => {
+      if (!dirs.has(path)) {
+        const i = path.lastIndexOf('/');
+        dirs.set(path, dirOf(i < 0 ? '' : path.slice(0, i)).then(d => d.getDirectoryHandle(diskName(path.slice(i + 1)), { create: true })));
+      }
+      return Promise.resolve(dirs.get(path));
+    };
+    return {
+      async file(rel) {
+        const i = rel.lastIndexOf('/'), d = await dirOf(i < 0 ? '' : rel.slice(0, i)), want = diskName(rel.slice(i + 1));
+        let n = want;
+        for (let k = 2; await exists(d, n); k++) n = nth(want, k);
+        return fsSink(await d.getFileHandle(n, { create: true }));
+      },
+    };
+  }
+
+  // service worker: the browser fetches /dl/<id>/<name>, the worker answers with a stream
+  // that asks this page for each chunk (see sw.js). registered once, on https only
+  let swReg = null, swPing = null, swOpen = 0;
+  if (window.isSecureContext && navigator.serviceWorker) {
+    // trusted types: register() takes a script url. the csp allows only this policy,
+    // and it only ever gives the one constant
+    let url = '/sw.js';
+    try { if (window.trustedTypes) url = trustedTypes.createPolicy('p2p-sw', { createScriptURL: () => '/sw.js' }).createScriptURL(''); } catch {}
+    navigator.serviceWorker.register(url).then(() => navigator.serviceWorker.ready).then(r => { swReg = r; }).catch(() => {});
+  }
+  const swOk = () => !!(swReg && swReg.active);
+  function swSink(name, size, zip) {
+    const id = newId() + newId(), ch = new MessageChannel(), q = [];
+    let qb = 0, asked = false, ended = false, aborted = false, err = null, written = 0, done = null;
+    const s = { kind: 'sw', onroom: null };
+    // the worker asks for one chunk at a time: data, the end, or that it's off
+    const give = () => {
+      asked = false;
+      if (aborted) return ch.port1.postMessage({ t: 'abort' });
+      if (q.length) {
+        const b = q.shift();
+        qb -= b.byteLength;
+        ch.port1.postMessage({ t: 'data', buf: b }, [b]);
+        if (s.onroom) s.onroom();
+      } else if (ended) { ch.port1.postMessage({ t: 'end' }); if (done) done(); }
+      else asked = true;
+    };
+    ch.port1.onmessage = e => {
+      const m = e.data || {};
+      if (m.t === 'pull') give();
+      else if (m.t === 'cancel') { err = new Error('the download was cancelled in the browser'); if (s.onroom) s.onroom(); }
+    };
+    swReg.active.postMessage({ t: 'dl', id, name, size, zip: !!zip }, [ch.port2]);
+    // started by a hidden frame: chromium doesn't send <a download> through service
+    // workers, and navigating this page would trip its "leave this page?" guard
+    const frame = el('iframe', { src: `/dl/${id}/${encodeURIComponent(name)}`, hidden: true, title: 'download' });
+    document.body.append(frame);
+    // workers that seem idle get stopped; while bytes flow, keep it awake
+    if (!swOpen++) swPing = setInterval(() => swReg && swReg.active && swReg.active.postMessage({ t: 'ping' }), 1e4);
+    let stopped = false;
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      if (!--swOpen) clearInterval(swPing);
+      setTimeout(() => frame.remove(), 3e4);
+    };
+    return Object.assign(s, {
+      write(u8, off) {
+        if (err) throw err;
+        if (off !== written) throw new Error('out of order');
+        const b = u8.slice().buffer;
+        written += u8.length;
+        q.push(b);
+        qb += b.byteLength;
+        if (asked) give();
+      },
+      full: () => !err && qb >= 4 * WIN,
+      // resolves once the last chunk has been taken
+      close: () => new Promise(r => { if (err) throw err; ended = true; done = () => { stop(); r(); }; if (asked) give(); }),
+      // the browser marks the download failed and drops what it had
+      abort: async () => { if (aborted) return; aborted = true; q.length = 0; qb = 0; if (asked) give(); else ch.port1.postMessage({ t: 'abort' }); stop(); },
+    });
+  }
+
+  // a local blob (the host's own file, or one of yours) into a sink, a slice at a time
+  async function pour(sink, blob, prog, sig) {
+    if (sink.whole) { sink.whole(blob); if (prog) prog(blob.size); return; }
+    const step = 1 << 20;
+    let next = blob.slice(0, step).arrayBuffer();
+    for (let o = 0; o < blob.size; o += step) {
+      const u = new Uint8Array(await next);
+      next = o + step < blob.size ? blob.slice(o + step, o + 2 * step).arrayBuffer() : null;
+      if (next) next.catch(() => {});
+      if (sig && sig.aborted) throw sig.reason;
+      while (sink.full && sink.full()) await new Promise(r => { sink.onroom = r; setTimeout(r, 200); });
+      sink.write(u, o);
+      if (prog) prog(o + u.length);
+    }
+  }
+
+  // ---- zip64, streamed, for folder downloads ---------------------------------
+  // store only (no compression), sizes after each file (data descriptors), crc worked
+  // out while the bytes go by, zip64 fields once anything passes 4 GB or 65,535 files.
+  // writes strictly in order, so it works on a stream
 
   const CRC = new Int32Array(256).map((_, n) => { for (let k = 0; k < 8; k++) n = n & 1 ? 0xEDB88320 ^ (n >>> 1) : n >>> 1; return n; });
-  async function zip(entries) {
-    if (entries.length > 0xffff || entries.reduce((s, e) => s + e.blob.size + 30 + e.name.length * 3, 0) > ZIP_MAX) {
-      throw new Error('folder too big to zip (4 GB or 65,535 files) — get the files one by one');
-    }
-    const out = [], cd = [];
-    let off = 0;
-    for (const { name, blob, mtime } of entries) {
-      let c = -1;
-      for (let o = 0; o < blob.size; o += 1 << 20) {
-        const u = new Uint8Array(await blob.slice(o, o + (1 << 20)).arrayBuffer());
-        for (let i = 0; i < u.length; i++) c = CRC[(c ^ u[i]) & 255] ^ (c >>> 8);
-      }
-      c = ~c >>> 0;
-      const d = new Date(Math.max(mtime || Date.now(), 315532800000));
-      const time = d.getHours() << 11 | d.getMinutes() << 5 | d.getSeconds() >> 1;
-      const date = (d.getFullYear() - 1980) << 9 | (d.getMonth() + 1) << 5 | d.getDate();
-      const nm = enc.encode(name);
-      const lh = new DataView(new ArrayBuffer(30));
-      const ch = new DataView(new ArrayBuffer(46));
-      [[lh, 0x04034b50, 4], [ch, 0x02014b50, 6]].forEach(([v, sig, b]) => {
-        v.setUint32(0, sig, true);
-        if (b === 6) v.setUint16(4, 20, true);
-        v.setUint16(b, 20, true);
-        v.setUint16(b + 2, 0x0800, true); // utf-8 names
-        v.setUint16(b + 6, time, true);
-        v.setUint16(b + 8, date, true);
-        v.setUint32(b + 10, c, true);
-        v.setUint32(b + 14, blob.size, true);
-        v.setUint32(b + 18, blob.size, true);
-        v.setUint16(b + 22, nm.length, true);
-      });
-      ch.setUint32(42, off, true);
-      out.push(lh, nm, blob);
-      cd.push(ch, nm);
-      off += 30 + nm.length + blob.size;
-    }
-    const cdSize = cd.reduce((s, p) => s + p.byteLength, 0);
-    const end = new DataView(new ArrayBuffer(22));
-    end.setUint32(0, 0x06054b50, true);
-    end.setUint16(8, entries.length, true);
-    end.setUint16(10, entries.length, true);
-    end.setUint32(12, cdSize, true);
-    end.setUint32(16, off, true);
-    return new Blob([...out, ...cd, end], { type: 'application/zip' });
+  const BIG = 0xffffffff;
+  const u64 = (v, at, n) => { v.setUint32(at, n >>> 0, true); v.setUint32(at + 4, Math.floor(n / 2 ** 32), true); };
+  function dosTime(ms) {
+    const d = new Date(Math.max(ms || Date.now(), 315532800000));
+    return { time: d.getHours() << 11 | d.getMinutes() << 5 | d.getSeconds() >> 1, date: (d.getFullYear() - 1980) << 9 | (d.getMonth() + 1) << 5 | d.getDate() };
+  }
+  function zipper(out) {
+    let off = 0, n = 0;
+    const cd = [];
+    const emit = u8 => { out.write(u8, off); off += u8.length; };
+    return {
+      // one file: write its bytes in order into what this returns, then end()
+      entry(name, size, mtime) {
+        const nm = enc.encode(name), z = size >= BIG, at = off, { time, date } = dosTime(mtime);
+        const lh = new DataView(new ArrayBuffer(30 + nm.length + (z ? 20 : 0)));
+        lh.setUint32(0, 0x04034b50, true);
+        lh.setUint16(4, z ? 45 : 20, true);
+        lh.setUint16(6, 0x0808, true); // sizes follow the data; utf-8 names
+        lh.setUint16(10, time, true);
+        lh.setUint16(12, date, true);
+        if (z) { lh.setUint32(18, BIG, true); lh.setUint32(22, BIG, true); }
+        lh.setUint16(26, nm.length, true);
+        lh.setUint16(28, z ? 20 : 0, true);
+        new Uint8Array(lh.buffer).set(nm, 30);
+        if (z) { lh.setUint16(30 + nm.length, 1, true); lh.setUint16(32 + nm.length, 16, true); } // zip64, sizes 0 here
+        emit(new Uint8Array(lh.buffer));
+        let crc = -1, got = 0;
+        return {
+          write(u8) {
+            for (let i = 0; i < u8.length; i++) crc = CRC[(crc ^ u8[i]) & 255] ^ (crc >>> 8);
+            got += u8.length;
+            emit(u8);
+          },
+          full: () => !!(out.full && out.full()),
+          set onroom(f) { out.onroom = f; },
+          end() {
+            if (got !== size) throw new Error('size mismatch');
+            crc = ~crc >>> 0;
+            const dd = new DataView(new ArrayBuffer(z ? 24 : 16));
+            dd.setUint32(0, 0x08074b50, true);
+            dd.setUint32(4, crc, true);
+            if (z) { u64(dd, 8, size); u64(dd, 16, size); } else { dd.setUint32(8, size, true); dd.setUint32(12, size, true); }
+            emit(new Uint8Array(dd.buffer));
+            cd.push({ nm, crc, size, at, time, date });
+            n++;
+          },
+        };
+      },
+      // the central directory, zip64 records if needed, the end record
+      finish() {
+        const start = off;
+        for (const e of cd) {
+          const zs = e.size >= BIG, zo = e.at >= BIG, xl = (zs ? 16 : 0) + (zo ? 8 : 0);
+          const v = new DataView(new ArrayBuffer(46 + e.nm.length + (xl ? 4 + xl : 0)));
+          v.setUint32(0, 0x02014b50, true);
+          v.setUint16(4, 45, true);
+          v.setUint16(6, xl ? 45 : 20, true);
+          v.setUint16(8, 0x0808, true);
+          v.setUint16(12, e.time, true);
+          v.setUint16(14, e.date, true);
+          v.setUint32(16, e.crc, true);
+          v.setUint32(20, zs ? BIG : e.size, true);
+          v.setUint32(24, zs ? BIG : e.size, true);
+          v.setUint16(28, e.nm.length, true);
+          v.setUint16(30, xl ? 4 + xl : 0, true);
+          v.setUint32(42, zo ? BIG : e.at, true);
+          new Uint8Array(v.buffer).set(e.nm, 46);
+          if (xl) {
+            let p = 46 + e.nm.length;
+            v.setUint16(p, 1, true);
+            v.setUint16(p + 2, xl, true);
+            p += 4;
+            if (zs) { u64(v, p, e.size); u64(v, p + 8, e.size); p += 16; }
+            if (zo) u64(v, p, e.at);
+          }
+          emit(new Uint8Array(v.buffer));
+        }
+        const size = off - start, z = n >= 0xffff || start >= BIG || size >= BIG;
+        if (z) {
+          const r = new DataView(new ArrayBuffer(76)), at = off;
+          r.setUint32(0, 0x06064b50, true);
+          u64(r, 4, 44);
+          r.setUint16(12, 45, true);
+          r.setUint16(14, 45, true);
+          u64(r, 24, n);
+          u64(r, 32, n);
+          u64(r, 40, size);
+          u64(r, 48, start);
+          r.setUint32(56, 0x07064b50, true); // locator
+          u64(r, 64, at);
+          r.setUint32(72, 1, true);
+          emit(new Uint8Array(r.buffer));
+        }
+        const e = new DataView(new ArrayBuffer(22));
+        e.setUint32(0, 0x06054b50, true);
+        e.setUint16(8, z ? 0xffff : n, true);
+        e.setUint16(10, z ? 0xffff : n, true);
+        e.setUint32(12, z ? BIG : size, true);
+        e.setUint32(16, z ? BIG : start, true);
+        emit(new Uint8Array(e.buffer));
+      },
+    };
   }
 
   // ---- dropped folders ----------------------------------------------------
@@ -1033,10 +1249,11 @@
         const have = new Map(), dups = new Map();
         for (const it of src.items.values()) if (it.fp) have.set(it.size + ':' + it.fp, [it.path, false]);
         let k = 0;
-        for (const it of items) {
-          k++;
-          if (items.length > 20 || it.f.size > 64 << 20) status(`checking ${items.length > 1 ? `${k}/${items.length}` : it.rel}…`);
+        await pool(items, 8, async it => {
           it.fp = await fingerprint(it.f, sig);
+          if (++k % 50 === 0 || it.f.size > 64 << 20) status(`checking ${items.length > 1 ? `${k}/${items.length}` : it.rel}…`);
+        }, sig);
+        for (const it of items) {
           if (sig.aborted) throw sig.reason;
           if (named.has(it)) continue;
           const key = it.f.size + ':' + it.fp;
@@ -1065,37 +1282,90 @@
     }
     // a waiting download says why
     const waiting = name => status(name ? `waiting for ${name}…` : '');
-    async function get(path, isDir) {
-      const name = path.split('/').pop(), ctl = track(), sig = ctl.signal;
+    // where this download goes. called straight from the click: the save pickers and
+    // starting a download need the click's user activation, so nothing waits before them
+    function choose(name, isDir, size) {
+      const picker = isDir ? window.showDirectoryPicker : window.showSaveFilePicker;
+      if (picker) {
+        try {
+          const h = isDir ? picker({ mode: 'readwrite' }) : picker({ suggestedName: diskName(name) });
+          h.catch(() => {});
+          return { kind: 'fs', h };
+        } catch {}
+      }
+      if (swOk()) return { kind: 'sw', sink: swSink(isDir ? name + '.zip' : name, isDir ? null : size, isDir) };
+      return { kind: 'mem' };
+    }
+    function get(path, isDir, btn) {
+      const it = !isDir && byPath().get(path);
+      const list = isDir ? [...src.items.values()].filter(f => f.path.startsWith(path + '/')) : it ? [it] : [];
+      if (!list.length) return status('not here any more');
+      const name = path.split('/').pop(), total = list.reduce((s, f) => s + f.size, 0);
+      fetchTo(choose(name, isDir, total), path, name, isDir, list, total, btn);
+    }
+    async function fetchTo(how, path, name, isDir, list, total, btn) {
+      const ctl = track(), sig = ctl.signal, sinks = new Set();
+      let sink = how.sink || null;
+      if (sink) sinks.add(sink);
       try {
+        // in memory only: say so before something big fills it (phones have less)
+        if (how.kind === 'mem' && total > (coarse() ? 256 << 20 : 1 << 30)) {
+          const ok = await new Promise(r => ask(btn || cancelBtn, `this browser can only save it from memory (${size(total)}). go ahead?`, () => r(true), () => r(false)));
+          if (!ok) { status(''); return; }
+        }
         if (!isDir) {
-          const it = byPath().get(path);
-          if (!it) throw new Error('not here any more');
-          const sink = memSink();
+          const it = list[0];
+          if (how.kind === 'fs') sinks.add(sink = await fsSink(await how.h));
+          if (!sink) sinks.add(sink = memSink());
           await src.fetch(it, sink, meter(it.size, () => `↓ ${name}`), sig, waiting);
           if (sig.aborted) throw sig.reason;
-          save(sink.blob(), name);
+          await sink.close();
+          sinks.delete(sink);
+          if (sink.kind === 'mem') save(sink.blob(), name);
           return status(`↓ ${name} done`);
         }
-        const list = [...src.items.values()].filter(f => f.path.startsWith(path + '/'));
-        const total = list.reduce((s, f) => s + f.size, 0), entries = [];
         let got = 0, done = 0;
         const show = meter(total, () => `↓ ${name}/ ${done}/${list.length}`);
-        await pool(list, 4, async (f, k) => {
+        const one = async (f, s) => {
           let last = 0;
           const step = b => { got += b - last; last = b; show(got); };
-          const sink = memSink();
-          await src.fetch(f, sink, step, sig, waiting);
-          done++;
+          await src.fetch(f, s, step, sig, waiting);
           step(f.size);
-          entries[k] = { name: f.path.slice(path.length - name.length), blob: sink.blob(), mtime: f.mtime };
-        }, sig);
-        status(`zipping ${name}…`);
-        save(await zip(entries), name + '.zip');
+          done++;
+        };
+        const rel = f => f.path.slice(path.length + 1);
+        if (how.kind === 'fs') {
+          // real files and folders, a few at a time
+          const dir = await fsDir(await how.h, name);
+          await pool(list, 4, async f => {
+            const s = await dir.file(rel(f));
+            sinks.add(s);
+            await one(f, s);
+            await s.close();
+            sinks.delete(s);
+          }, sig);
+          return status(`↓ ${name}/ done`);
+        }
+        // one zip, written as it arrives
+        if (!sink) sinks.add(sink = memSink());
+        const z = zipper(sink);
+        for (const f of list) {
+          if (sig.aborted) throw sig.reason;
+          const e = z.entry(name + '/' + rel(f), f.size, f.mtime);
+          await one(f, e);
+          e.end();
+        }
+        z.finish();
+        await sink.close();
+        sinks.delete(sink);
+        if (sink.kind === 'mem') save(sink.blob(), name + '.zip');
         status(`↓ ${name}.zip done`);
       } catch (e) {
         const stopped = sig.aborted;
         ctl.abort(); // a failed file stops the rest of the folder
+        // nothing half-written left behind, where the browser lets us
+        for (const s of sinks) await s.abort().catch(() => {});
+        if (!stopped && e && e.name === 'AbortError') return status(''); // the save picker was closed
         stopped ? status(`↓ ${name} cancelled`) : fail(e);
       } finally {
         untrack(ctl);
@@ -1155,13 +1425,13 @@
           return row(
             el('button', { class: 'link', onclick: () => cd(pre + d) }, d + '/'),
             `${x.n} · ${size(x.size)} · ${whos(x.owners)}${gone ? ' · offline' : ''}`,
-            [el('button', { disabled: gone, onclick: () => get(pre + d, true) }, 'get'), w && el('button', { onclick: e => ask(e.target, `delete ${d}/ and all inside?`, () => src.rmDir(pre + d)) }, 'del')],
+            [el('button', { disabled: gone, onclick: e => get(pre + d, true, e.target) }, 'get'), w && el('button', { onclick: e => ask(e.target, `delete ${d}/ and all inside?`, () => src.rmDir(pre + d)) }, 'del')],
             gone);
         }),
         ...files.sort((a, b) => byName(a.path, b.path)).map(f => {
           const name = f.path.slice(pre.length), off = src.offline(f);
           return row(el('span', {}, name), `${size(f.size)} · ${who(f.owner)}${off ? ' · offline' : ''}`,
-            [el('button', { disabled: !!off, onclick: () => get(f.path) }, 'get'), w && el('button', { onclick: e => ask(e.target, f.owner === src.me() ? 'stop sharing this file?' : 'delete this file?', () => src.rm([f.id])) }, 'del')], off);
+            [el('button', { disabled: !!off, onclick: e => get(f.path, false, e.target) }, 'get'), w && el('button', { onclick: e => ask(e.target, f.owner === src.me() ? 'stop sharing this file?' : 'delete this file?', () => src.rm([f.id])) }, 'del')], off);
         }),
       );
       if (!dirs.size && !files.length) filesEl.append(el('li', { class: 'empty' }, !w ? 'empty' : coarse() ? 'empty — tap + files to add some' : 'empty — drop files or folders, or paste an image, anywhere on the page'));
@@ -1371,6 +1641,7 @@
         x.waitFor = r.wait || x.waitFor;
       };
       sig.addEventListener('abort', () => x.finish(sig.reason), { once: true });
+      sink.onroom = () => { const a = x.att; if (a && a.meta) fill(a); };
       xfers.add(x);
       x.go();
     });
@@ -1474,13 +1745,17 @@
       for (const p of peers.values()) if (p.member) p.c.send(m);
     }
     let shown = false;
+    // changes go out, and the page redraws, at most every 80 ms however many there are
     function dirty() {
-      clearTimeout(flushT);
-      flushT = setTimeout(flush, 80);
-      if (!shown) return;
-      v.refresh();
-      showPeople();
-      kick(xfers);
+      if (flushT) return;
+      flushT = setTimeout(() => {
+        flushT = null;
+        flush();
+        if (!shown) return;
+        v.refresh();
+        showPeople();
+        kick(xfers);
+      }, 80);
     }
     const putItem = it => { items.set(it.id, it); paths.set(it.path, it.id); D.rm.delete(it.id); D.add.set(it.id, it); dirty(); };
     const upItem = it => { if (!D.add.has(it.id)) D.up.set(it.id, it); dirty(); };
@@ -1558,19 +1833,27 @@
       const where = place(list, myId, dir);
       let done = 0;
       try {
-        for (const [k, it] of list.entries()) {
+        // up to 500 files or 64 MB per transaction: thousands of small files copy quickly
+        for (let k = 0; k < list.length;) {
           if (sig.aborted) throw sig.reason;
-          const path = where[k];
-          if (!path) continue;
-          say(list.length > 1 ? `↑ copying ${done + 1}/${list.length}…` : `↑ copying ${it.rel}…`);
-          const rec = { id: newId(), path, size: it.f.size, mtime: Number.isSafeInteger(it.f.lastModified) ? it.f.lastModified : Date.now(), fp: it.fp, owner: myId, kind: 'stored', off: 0 };
-          await db.put('items', { slug: sess.slug, id: rec.id, path, mtime: rec.mtime, fp: rec.fp, blob: it.f }, sig);
-          if (sig.aborted) { await db.del('items', rec.id).catch(() => {}); throw sig.reason; }
-          // the same name of yours: the new one replaces it
-          const old = items.get(paths.get(path));
-          if (old && old.owner === myId) remove([old], myId, 'replaced');
-          putItem(rec);
-          done++;
+          const batch = [];
+          for (let bytes = 0; k < list.length && batch.length < 500 && (!batch.length || bytes + list[k].f.size <= 64 << 20); k++) {
+            const it = list[k], path = where[k];
+            if (!path) continue;
+            bytes += it.f.size;
+            batch.push([it, { id: newId(), path, size: it.f.size, mtime: Number.isSafeInteger(it.f.lastModified) ? it.f.lastModified : Date.now(), fp: it.fp, owner: myId, kind: 'stored', off: 0 }]);
+          }
+          if (!batch.length) continue;
+          say(list.length > 1 ? `↑ copying ${done + 1}/${list.length}…` : `↑ copying ${batch[0][0].rel}…`);
+          await db.putAll('items', batch.map(([it, r]) => ({ id: r.id, path: r.path, mtime: r.mtime, fp: r.fp, blob: it.f })), sig);
+          if (sig.aborted) { await Promise.all(batch.map(([, r]) => db.del('items', r.id).catch(() => {}))); throw sig.reason; }
+          for (const [, rec] of batch) {
+            // the same name of yours: the new one replaces it
+            const old = items.get(paths.get(rec.path));
+            if (old && old.owner === myId) remove([old], myId, 'replaced');
+            putItem(rec);
+            done++;
+          }
         }
       } catch (e) {
         throw Object.assign(e instanceof Error ? e : new Error(String(e)), { done });
@@ -1623,7 +1906,7 @@
         if (it.kind === 'stored') {
           const r = await db.get('items', it.id);
           if (!r || !r.blob) throw new Error('not here any more');
-          return sink.whole(r.blob);
+          return pour(sink, r.blob, prog, sig);
         }
         return download(it, sink, prog, sig, waiting, route, xfers);
       },
@@ -2536,7 +2819,7 @@
       },
       fetch: (it, sink, prog, sig, waiting) => {
         const x = mine.get(it.id);
-        if (x && it.owner === myId) return sink.whole(x.f);
+        if (x && it.owner === myId) return pour(sink, x.f, prog, sig);
         return download(it, sink, prog, sig, waiting, route, xfers);
       },
       rm: ids => { for (const id of ids) mine.delete(id); post({ t: 'rm', ids }); },
