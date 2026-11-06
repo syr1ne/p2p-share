@@ -115,6 +115,16 @@ function ipOf(req) {
   }
   return req.socket.remoteAddress || '?';
 }
+// limits count per address, and per /64 for ipv6 (one home or phone gets a whole /64,
+// so counting single addresses would let one person look like millions)
+function limitKey(ip) {
+  ip = String(ip).replace(/^::ffff:(?=\d+\.)/, '');
+  if (!ip.includes(':')) return ip;
+  const [a, b = ''] = ip.split('::'), head = a ? a.split(':') : [], tail = b ? b.split(':') : [];
+  const full = [...head, ...Array(Math.max(0, 8 - head.length - tail.length)).fill('0'), ...tail];
+  return full.slice(0, 4).map(h => h.toLowerCase().replace(/^0+(?=.)/, '')).join(':') + '::/64';
+}
+let proxyWarned = false;
 
 function originOk(req) {
   try { return new URL(req.headers.origin).host === (ORIGIN_HOST || req.headers.host); } catch { return false; }
@@ -144,7 +154,10 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024, perMes
 
 server.on('upgrade', (req, sock, head) => {
   sock.on('error', () => {});
-  const ip = ipOf(req);
+  const ip = limitKey(ipOf(req));
+  // behind a proxy without TRUST_PROXY everyone shares the proxy's address, so the limits
+  // below would apply to all users together
+  if (!TRUST_PROXY && !proxyWarned && req.headers['x-forwarded-for']) { proxyWarned = true; console.warn('requests carry x-forwarded-for but TRUST_PROXY is unset: per-ip limits see the proxy as one client'); }
   if (req.url !== '/ws' || !originOk(req) || (conns.get(ip) || 0) >= MAX_CONN_IP) {
     sock.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
     return;
@@ -293,7 +306,10 @@ function handle(ws, m) {
       if (ws.role || !validSlug(slug) || !PIN.test(pin)) return send(ws, { t: 'err', e: 'bad' });
       const room = rooms.get(slug);
       if (!room) return send(ws, { t: 'err', e: 'nf' });
-      if (count(ipFails, ws.ip) >= 5 || count(roomFails, slug) >= 50) return send(ws, { t: 'err', e: 'limit' });
+      // a share under attack locks out addresses that have guessed wrong, not everyone:
+      // someone who hasn't failed recently still gets in with the right pin
+      const failed = count(ipFails, ws.ip);
+      if (failed >= 5 || (failed > 0 && count(roomFails, slug) >= 50)) return send(ws, { t: 'err', e: 'limit' });
       if (!same(room.pin, hash(slug + ':' + pin))) {
         hit(ipFails, ws.ip, 15 * 6e4);
         hit(roomFails, slug, 36e5);

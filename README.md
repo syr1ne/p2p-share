@@ -130,7 +130,12 @@ the defaults above.
   through the host's browser in the clear (each hop is encrypted, the host is an
   endpoint of both). the host never stores them and holds at most a few MiB.
 - a guest's ip is only revealed to the owner after the right pin, and the reverse.
-- a new pin also lifts any wrong-pin lockout on that name.
+  in two-way mode, a guest who shares files also shows its ip to the members who
+  download them directly (that's what a direct link is); guests sharing nothing
+  never accept a link.
+- a new pin also lifts any wrong-pin lockout on that name. while a name is locked,
+  addresses that haven't guessed wrong recently can still join with the right pin.
+  ipv6 limits count per /64.
 - transport: dtls-encrypted webrtc, or the aes-gcm relay. the signaling socket is
   same-origin only, rate limited, capped at 128 KB per message, and relay traffic
   is throttled per connection (back-pressure, not dropped).
